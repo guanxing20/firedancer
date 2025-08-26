@@ -1,5 +1,3 @@
-#include "../../util/fd_util_base.h"
-#include "../fd_flamenco_base.h"
 #include "fd_acc_mgr.h"
 #include "fd_runtime.h"
 #include "fd_runtime_err.h"
@@ -116,8 +114,9 @@ void add_address_lookup_table( fd_funk_t *     funk,
                                ulong *         out_pay_sz ) {
 
   FD_TXN_ACCOUNT_DECL( rec );
+  fd_funk_rec_prepare_t prepare = {0};
   const ulong rec_sz = FD_LOOKUP_TABLE_META_SIZE+alt_acct_data_sz;
-  int result = fd_txn_account_init_from_funk_mutable( rec, alt_acct_addr, funk, funk_txn, /* do_create */ 1, rec_sz );
+  int result = fd_txn_account_init_from_funk_mutable( rec, alt_acct_addr, funk, funk_txn, /* do_create */ 1, rec_sz, &prepare );
   FD_TEST( result==FD_ACC_MGR_SUCCESS );
 
   fd_address_lookup_table_state_t table;
@@ -126,16 +125,16 @@ void add_address_lookup_table( fd_funk_t *     funk,
   table.inner.lookup_table.meta.last_extended_slot = 0; /* this makes fd_get_active_addresses_len return 2 */
 
   fd_bincode_encode_ctx_t encode_ctx = {
-    .data    = rec->vt->get_data_mut( rec ),
-    .dataend = rec->vt->get_data_mut( rec ) + FD_LOOKUP_TABLE_META_SIZE
+    .data    = fd_txn_account_get_data_mut( rec ),
+    .dataend = fd_txn_account_get_data_mut( rec ) + FD_LOOKUP_TABLE_META_SIZE
   };
   int err = fd_address_lookup_table_state_encode( &table, &encode_ctx );
   FD_TEST( err==0 );
 
-  rec->vt->set_data_len( rec, rec_sz );
-  rec->vt->set_owner( rec, &fd_solana_address_lookup_table_program_id );
-  fd_memcpy( rec->vt->get_data_mut( rec )+FD_LOOKUP_TABLE_META_SIZE, alt_acct_data, alt_acct_data_sz );
-  fd_txn_account_mutable_fini( rec, funk, funk_txn );
+  fd_txn_account_set_data_len( rec, rec_sz );
+  fd_txn_account_set_owner( rec, &fd_solana_address_lookup_table_program_id );
+  fd_memcpy( fd_txn_account_get_data_mut( rec )+FD_LOOKUP_TABLE_META_SIZE, alt_acct_data, alt_acct_data_sz );
+  fd_txn_account_mutable_fini( rec, funk, funk_txn, &prepare );
   /* other metadata fields (e.g., slot, hash, ...) are ommited */
 
   /* Append an address lookup table after txn_payload */

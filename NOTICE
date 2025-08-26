@@ -234,8 +234,17 @@ From https://cr.yp.to/chacha.html and https://datatracker.ietf.org/doc/html/rfc7
 
 =======================================================================
 
-The BLAKE3 implementation in src/ballet/blake3 is currently a modified
-implementation of the BLAKE3 project implementation circa 2023-May.
+The implementation of the BLAKE3 compression function in
+src/ballet/blake3 was derived from the BLAKE3 project
+circa 2023-May.  This includes the following files:
+- src/ballet/blake3/fd_blake3/fd_blake3_ref.c
+- src/ballet/blake3/fd_blake3/fd_blake3_sse41.c
+- src/ballet/blake3/fd_blake3/fd_blake3_avx2.c
+- src/ballet/blake3/fd_blake3/fd_blake3_avx512.c
+
+The code was adapted to fit the Firedancer code style
+and has undergone various performance improvements.
+
 From
 https://github.com/BLAKE3-team/BLAKE3/tree/master/c
 
@@ -521,5 +530,18 @@ HPACK Huffman decoder from nghttp2 (circa 2025-Mar).  Original sources:
  * OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
  * WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
+
+=======================================================================
+
+The compiled SBPF programs used for tests and available in
+src/ballet/sbpf/fixtures/ are taken from Anza's Agave and Token program,
+both released under Apache License 2.0.
+
+https://github.com/anza-xyz/agave/tree/v2.3.7/svm/tests/example-programs/hello-solana
+https://github.com/solana-program/token/tree/program%40v8.0.0/p-token
+
+                                 Apache License
+                           Version 2.0, January 2004
+                        http://www.apache.org/licenses/
 
 =======================================================================

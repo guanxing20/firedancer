@@ -2,26 +2,37 @@
 #define HEADER_fd_src_discof_restore_utils_fd_ssmsg_h
 
 #include "../../../flamenco/types/fd_types.h"
+#include "../../../flamenco/runtime/fd_runtime_const.h"
+#include "../../../flamenco/stakes/fd_vote_states.h"
 
 #define FD_SSMSG_MANIFEST_FULL        (0) /* A snapshot manifest message from the full snapshot */
 #define FD_SSMSG_MANIFEST_INCREMENTAL (1) /* A snapshot manifest message from the incremental snapshot */
 #define FD_SSMSG_DONE                 (2) /* Indicates the snapshot is fully loaded and tiles are shutting down */
 
-/* TODO: Bound this correctly */
-#define MAX_STAKE_DELEGATIONS (10UL*1024UL*1024UL)
-
 FD_FN_CONST static inline ulong
-fd_ssmsg_sig( ulong message,
-              ulong manifest_size ) {
-  return (manifest_size << 2) | (message & 0x3UL);
+fd_ssmsg_sig( ulong message ) {
+  return (message & 0x3UL);
 }
 
-FD_FN_CONST static inline ulong fd_ssmsg_sig_manifest_size( ulong sig ) { return (sig >> 2); }
 FD_FN_CONST static inline ulong fd_ssmsg_sig_message( ulong sig ) { return (sig & 0x3UL); }
+struct epoch_credits {
+  ulong epoch;
+  ulong credits;
+  ulong prev_credits;
+};
+
+typedef struct epoch_credits epoch_credits_t;
 
 struct fd_snapshot_manifest_vote_account {
   /* The pubkey of the vote account */
   uchar vote_account_pubkey[ 32UL ];
+
+  /* The pubkey of the node account */
+  uchar node_account_pubkey[ 32UL ];
+
+  ulong stake;
+  ulong last_slot;
+  long  last_timestamp;
 
   /* The percent of inflation rewards earned by the validator and
      deposited into the validator's vote account, from 0 to 100%.
@@ -34,29 +45,89 @@ struct fd_snapshot_manifest_vote_account {
      entry at epoch_credits[0] is for the current epoch,
      epoch_credits[1] is for the previous epoch, and so on.  In cases of
      booting a new chain from genesis, or for new vote accounts the
-     epoch credits history may be short. */
+     epoch credits history may be short.  The maximum number of entries
+     in the epoch credits history is 64. */
   ulong epoch_credits_history_len;
-  ulong epoch_credits[ 64UL ]; /* TODO: Bound correctly */
+  epoch_credits_t epoch_credits[ EPOCH_CREDITS_MAX ];
 };
 
 typedef struct fd_snapshot_manifest_vote_account fd_snapshot_manifest_vote_account_t;
 
 struct fd_snapshot_manifest_stake_delegation {
-  /* The stake account pubkey */
-  uchar stake_account_pubkey[ 32UL ];
+  /* The stake pubkey */
+  uchar stake_pubkey[ 32UL ];
 
-  /* The voter pubkey to whom the stake is delegated */
-  uchar vote_account_pubkey[ 32UL ];
+  /* The vote pubkey that the stake account is delegated to */
+  uchar vote_pubkey[ 32UL ];
 
-  /* The activated stake amount that is delegated */
-  ulong stake;
+  /* The amount of stake delegated */
+  ulong stake_delegation;
+
+  /* The activation epoch of the stake delegation */
+  ulong activation_epoch;
+
+  /* The deactivation epoch of the stake delegation */
+  ulong deactivation_epoch;
+
+  /* The amount of credits observed for the stake delegation */
+  ulong credits_observed;
+
+  /* The warmup cooldown rate for the stake delegation */
+  double warmup_cooldown_rate;
 };
 
 typedef struct fd_snapshot_manifest_stake_delegation fd_snapshot_manifest_stake_delegation_t;
 
+/* TODO: Consider combining this struct with
+   fd_snapshot_manifest_vote_account. */
+
+struct fd_snapshot_manifest_vote_stakes {
+  /* The vote pubkey */
+  uchar vote[ 32UL ];
+
+  /* The validator identity pubkey, aka node pubkey */
+  uchar identity[ 32UL ];
+
+  /* The commission account for inflation rewards (vote, before SIMD-0232) */
+  uchar commission_inflation[ 32UL ];
+
+  /* The commission account for block revenue (identity, before SIMD-0232) */
+  uchar commission_block[ 32UL ];
+
+  /* The validator BLS pubkey (used after SIMD-0326: Alpenglow) */
+  uchar identity_bls[ 48UL ];
+
+  /* The total amount of active stake for the vote account */
+  ulong stake;
+
+  /* The latest slot and timestmap that the vote account voted on in
+     the given epoch. */
+  ulong slot;
+  long  timestamp;
+
+  /* The validator's commission rate as of the given epoch. */
+  uchar commission;
+
+  /* The epoch credits array tracks the history of how many credits the
+     provided vote account earned in each of the past epochs.  The
+     entry at epoch_credits[0] is for the current epoch,
+     epoch_credits[1] is for the previous epoch, and so on.  In cases of
+     booting a new chain from genesis, or for new vote accounts the
+     epoch credits history may be short.  The maximum number of entries
+     in the epoch credits history is 64. */
+  ulong           epoch_credits_history_len;
+  epoch_credits_t epoch_credits[ EPOCH_CREDITS_MAX ];
+};
+
+typedef struct fd_snapshot_manifest_vote_stakes fd_snapshot_manifest_vote_stakes_t;
+
 struct fd_snapshot_manifest_epoch_stakes {
-  ulong                                   stakes_len;
-  fd_snapshot_manifest_stake_delegation_t stakes[ MAX_STAKE_DELEGATIONS ];
+  /* The total amount of active stake at the end of the given epoch.*/
+  ulong                              total_stake;
+
+  /* The vote accounts and their stakes for a given epoch. */
+  ulong                              vote_stakes_len;
+  fd_snapshot_manifest_vote_stakes_t vote_stakes[ FD_RUNTIME_MAX_VOTE_ACCOUNTS ];
 };
 
 typedef struct fd_snapshot_manifest_epoch_stakes fd_snapshot_manifest_epoch_stakes_t;
@@ -102,7 +173,12 @@ struct fd_snapshot_manifest_epoch_schedule_params {
      slots_per_epoch.  This value is set by default to true at genesis,
      though it may be configured differently in development
      environments. */
-  int warmup;
+  uchar warmup;
+
+  /* TODO: Probably remove this? Redundant and can be calculated from
+     the above. */
+  ulong first_normal_epoch;
+  ulong first_normal_slot;
 };
 
 typedef struct fd_snapshot_manifest_epoch_schedule_params fd_snapshot_manifest_epoch_schedule_params_t;
@@ -149,21 +225,27 @@ struct fd_snapshot_manifest_fee_rate_governor {
 
 typedef struct fd_snapshot_manifest_fee_rate_governor fd_snapshot_manifest_fee_rate_governor_t;
 
-struct fd_snapshot_repair {
-   /* The slot to start repairing from. */
-   ulong slot;
-
-   /* Repair is based on stake weights...  TODO: how? */
-   ulong                                   stakes_len;
-   fd_snapshot_manifest_stake_delegation_t stakes[ 1024 * 1024UL ];
+struct fd_snapshot_manifest_rent {
+  ulong lamports_per_uint8_year;
+  double exemption_threshold;
+  uchar burn_percent;
 };
 
-typedef struct fd_snapshot_repair fd_snapshot_repair_t;
+typedef struct fd_snapshot_manifest_rent fd_snapshot_manifest_rent_t;
+
+struct fd_snapshot_manifest_blockhash {
+   uchar hash[ 32UL ];
+   ulong lamports_per_signature;
+   ulong hash_index;
+   ulong timestamp;
+};
+
+typedef struct fd_snapshot_manifest_blockhash fd_snapshot_manifest_blockhash_t;
 
 struct fd_snapshot_manifest {
   /* The UNIX timestamp when the genesis block was for this chain
      was created, in nanoseconds.  */
-  long creation_time_ns;
+  ulong creation_time_millis;
 
   /* At genesis, certain parameters can be set which control the
      inflation rewards going forward.  This includes what the initial
@@ -192,6 +274,8 @@ struct fd_snapshot_manifest {
      feature flags. */
   fd_snapshot_manifest_fee_rate_governor_t fee_rate_governor;
 
+  fd_snapshot_manifest_rent_t rent_params;
+
   /* The slot number for this snapshot */
   ulong slot;
 
@@ -200,6 +284,9 @@ struct fd_snapshot_manifest {
      landed block, but it does not increment for skipped slots, so the
      block_height will always be less than or equal to the slot. */
   ulong block_height;
+
+  /* TODO: Document */
+  ulong collector_fees;
 
   /* The parent slot is the slot that this block builds on top of.  It
      is typically slot-1, but can be an arbitrary amount of slots
@@ -256,6 +343,12 @@ struct fd_snapshot_manifest {
   int   has_epoch_account_hash;
   uchar epoch_account_hash[ 32UL ];
 
+  ulong blockhashes_len;
+  fd_snapshot_manifest_blockhash_t blockhashes[ 301UL ];
+
+  ulong hard_forks_len;
+  ulong hard_forks[ 64UL ];
+
   /* The proof of history component "proves" the passage of time (see
      extended discussion in PoH tile for what that acutally means) by
      continually doing sha256 hashes.  A certain number of hashes are
@@ -266,6 +359,12 @@ struct fd_snapshot_manifest {
      at 64 and is unlikely to change, however it might be configured
      differently in development environments. */
   ulong ticks_per_slot;
+
+  /* TODO: Document */
+  ulong ns_per_slot;
+
+  /* TODO: Document */
+  double slots_per_year;
 
   /* The proof of history component typically requires every block to
      have 64 "ticks" in it (although this is configurable during
@@ -295,6 +394,19 @@ struct fd_snapshot_manifest {
      rewards and validating snapshots. */
   ulong capitalization;
 
+  /* TODO: Why is this needed? */
+  ulong tick_height;
+  ulong max_tick_height;
+
+  /* TODO: What is this? */
+  ulong lamports_per_signature;
+
+  /* TODO: Why is this needed? */
+  ulong transaction_count;
+
+  /* TODO: Why is this needed? */
+  ulong signature_count;
+
   /* A list of this epoch's vote accounts and their state relating to
      rewards distribution, which includes the vote account's commission
      and vote credits.
@@ -305,45 +417,36 @@ struct fd_snapshot_manifest {
      percentage of the inflation rewards for the epoch and validator
      uptime, which is measured by vote account vote credits. */
   ulong                               vote_accounts_len;
-  fd_snapshot_manifest_vote_account_t vote_accounts[ 16384UL ]; /* TODO: Bound correctly */
+  fd_snapshot_manifest_vote_account_t vote_accounts[ FD_RUNTIME_MAX_VOTE_ACCOUNTS ];
+
+  ulong stake_delegations_len;
+  fd_snapshot_manifest_stake_delegation_t stake_delegations[ FD_RUNTIME_MAX_STAKE_ACCOUNTS ];
 
   /* Epoch stakes represent the exact amount staked to each vote
-     account pubkey for each of the current, previous, and previous
-     before that epochs. They are primarily used to derive the leader
-     schedule.  Three are required because
+     account at the beginning of the previous epoch. They are
+     primarily used to derive the leader schedule.
 
-       E-2 - We need epoch stakes from two epochs ago to calculate the
-             leader schedule for the current epoch E.
-       E-1 - We need
-             epoch stakes from one epoch ago to calculate the leader
-             schedule for the next epoch E+1.
-      E   - We need epoch stakes
-             for the current epoch, which we will then incrementally
-             update as the epoch continues, to eventually (when the
-             epoch finishes) calculate the leader schedule for next next
-             epoch E+2.
+     Let's say the manifest is at epoch E.
 
-     The epoch stakes are stored in an array, where epoch_stakes[0] is
-     the list of current epoch stakes, and epoch_stakes[1] is for the
-     previous epoch, and so on.  There are almost always 3 epoch stakes,
-     except in certain cases where the chain is close to genesis, when
-     there might only be 1 or 2. */
-  ulong                                   epoch_stakes_len;
-  fd_snapshot_manifest_epoch_stakes_t     epoch_stakes[ 3UL ];
+     The field versioned_epoch_stakes in the manifest is a map
+
+       <epoch> -> <VersionedEpochStakes>
+
+     where <epoch> assumes these values:
+
+       E   - represents the stakes at the beginning of epoch E-1,
+             used to compute the leader schedule at E.
+
+       E+1 - represents the stakes at the beginning of epoch E,
+             used to compute the leader schedule at E+1.
+
+     The epoch stakes are stored in an array, where epoch_stakes[0]
+     contains the data to generate the current leader schedule (i.e. E)
+     and epoch_stakes[1] contains the data to generate the next leader
+     schedule (i.e. E+1). */
+  fd_snapshot_manifest_epoch_stakes_t epoch_stakes[ 2UL ];
 };
 
 typedef struct fd_snapshot_manifest fd_snapshot_manifest_t;
-
-/* Forward Declarations */
-
-typedef struct fd_solana_manifest fd_solana_manifest_t;
-
-FD_PROTOTYPES_BEGIN
-
-fd_snapshot_manifest_t *
-fd_snapshot_manifest_init_from_solana_manifest( void *                        mem,
-                                                fd_solana_manifest_global_t * solana_manifest );
-
-FD_PROTOTYPES_END
 
 #endif /* HEADER_fd_src_discof_restore_utils_fd_ssmsg_h */

@@ -31,7 +31,7 @@ fd_topob_new( void * mem,
   return topo;
 }
 
-void
+fd_topo_wksp_t *
 fd_topob_wksp( fd_topo_t *  topo,
                char const * name ) {
   if( FD_UNLIKELY( !topo || !name || !strlen( name ) ) ) FD_LOG_ERR(( "NULL args" ));
@@ -43,6 +43,7 @@ fd_topob_wksp( fd_topo_t *  topo,
   wksp->id = topo->wksp_cnt;
   wksp->is_locked = 1;
   topo->wksp_cnt++;
+  return wksp;
 }
 
 fd_topo_obj_t *
@@ -344,6 +345,7 @@ fd_topob_auto_layout( fd_topo_t * topo,
     "metric",
     "cswtch",
     "bencho",
+    "ipecho", /* FIREDANCER ONLY */
   };
 
   char const * ORDERED[] = {
@@ -359,13 +361,14 @@ fd_topob_auto_layout( fd_topo_t * topo,
     "pack",
     "bank",   /* FRANK only */
     "poh",    /* FRANK only */
-    "poh",   /* FIREDANCER only */
+    "pohi",   /* FIREDANCER only */
     "shred",
     "store",  /* FRANK only */
     "storei", /* FIREDANCER only */
     "sign",
     "plugin",
     "gui",
+    "gossvf", /* FIREDANCER only */
     "gossip", /* FIREDANCER only */
     "repair", /* FIREDANCER only */
     "replay", /* FIREDANCER only */
@@ -377,7 +380,9 @@ fd_topob_auto_layout( fd_topo_t * topo,
     "pktgen",
     "snaprd", /* FIREDANCER only */
     "snapdc", /* FIREDANCER only */
-    "snapin"  /* FIREDANCER only */
+    "snapin", /* FIREDANCER only */
+    "arch_f", /* FIREDANCER only */
+    "arch_w", /* FIREDANCER only */
   };
 
   char const * CRITICAL_TILES[] = {

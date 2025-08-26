@@ -20,10 +20,10 @@ TRASH_HASH=""
 LOG="/tmp/ledger_log$$"
 TILE_CPUS="--tile-cpus 5-15"
 THREAD_MEM_BOUND="--thread-mem-bound 0"
-INGEST_MDOE="rocksdb"
+INGEST_MODE="rocksdb"
 CLUSTER_VERSION=""
 DUMP_DIR=${DUMP_DIR:="./dump"}
-ONE_OFFS="2B2SBNbUcr438LtGXNcJNBP2GBSxjx81F945SdSkUSfC,LTHasHQX6661DaDD4S6A2TFi6QBuiwXKv66fB1obfHq,LTdLt9Ycbyoipz5fLysCi1NnDnASsZfmJLJXts5ZxZz,LTsNAP8h1voEVVToMNBNqoiNQex4aqfUrbFhRH3mSQ2"
+ONE_OFFS=""
 HUGE_TLBFS_MOUNT_PATH=${HUGE_TLBFS_MOUNT_PATH:="/mnt/.fd"}
 HUGE_TLBFS_ALLOW_HUGEPAGE_INCREASE=${HUGE_TLBFS_ALLOW_HUGEPAGE_INCREASE:="true"}
 HAS_INCREMENTAL="false"
@@ -75,7 +75,7 @@ while [[ $# -gt 0 ]]; do
        shift
        ;;
     -i|--ingest-mode)
-       INGEST_MDOE="$2"
+       INGEST_MODE="$2"
        shift
        shift
        ;;
@@ -160,17 +160,14 @@ echo "
         rocksdb_path = \"$DUMP/$LEDGER/rocksdb\"
         shredcap_path = \"$DUMP/$LEDGER/slices.bin\"
         bank_hash_path = \"$DUMP/$LEDGER/bank_hashes.bin\"
-        ingest_mode = \"$INGEST_MDOE\"
+        ingest_mode = \"$INGEST_MODE\"
     [tiles.replay]
         cluster_version = \"$CLUSTER_VERSION\"
         enable_features = [ $FORMATTED_ONE_OFFS ]
     [tiles.gui]
         enabled = false
-[blockstore]
-    shred_max = 16777216
-    block_max = 8192
-    alloc_max = 10737418240
-    file = \"$DUMP/$LEDGER/backtest.blockstore\"
+[store]
+    max_completed_shred_sets = 32768
 [funk]
     heap_size_gib = $FUNK_PAGES
     max_account_records = $INDEX_MAX
@@ -179,13 +176,12 @@ echo "
 [runtime]
     heap_size_gib = 50
     [runtime.limits]
-        max_banks = 64
+        max_total_banks = 4
+        max_fork_width = 4
 [development]
     sandbox = false
     no_agave = true
     no_clone = true
-[store]
-    max_completed_shred_sets = 32000
 [log]
     level_stderr = \"INFO\"
     path = \"$LOG\"

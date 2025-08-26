@@ -10,8 +10,6 @@
 
 #define NAME "snapin"
 
-#define ACCV_LG_SLOT_CNT 23 /* 8.39 million AppendVecs ought to be enough */
-
 /* The snapin tile is a state machine that parses and loads a full
    and optionally an incremental snapshot.  It is currently responsible
    for loading accounts into an in-memory database, though this may
@@ -25,6 +23,9 @@
 struct fd_snapin_tile {
   int full;
   int state;
+
+  ulong seed;
+  long boot_timestamp;
 
   fd_funk_t       funk[1];
   fd_funk_txn_t * funk_txn;
@@ -59,20 +60,23 @@ typedef struct fd_snapin_tile fd_snapin_tile_t;
 
 static inline int
 should_shutdown( fd_snapin_tile_t * ctx ) {
+  if( FD_UNLIKELY( ctx->state==FD_SNAPIN_STATE_SHUTDOWN ) ) {
+    FD_LOG_NOTICE(( "loaded %.1fM accounts from snapshot in %.1f seconds", (double)ctx->metrics.accounts_inserted/1e6, (double)(fd_log_wallclock()-ctx->boot_timestamp)/1e9 ));
+  }
   return ctx->state==FD_SNAPIN_STATE_SHUTDOWN;
 }
 
 static ulong
 scratch_align( void ) {
-  return alignof(fd_snapin_tile_t);
+  return 128UL;
 }
 
 static ulong
 scratch_footprint( fd_topo_tile_t const * tile ) {
   (void)tile;
   ulong l = FD_LAYOUT_INIT;
-  l = FD_LAYOUT_APPEND( l, alignof(fd_snapin_tile_t),  sizeof(fd_snapin_tile_t) );
-  l = FD_LAYOUT_APPEND( l, fd_snapshot_parser_align(), fd_snapshot_parser_footprint( ACCV_LG_SLOT_CNT ) );
+  l = FD_LAYOUT_APPEND( l, alignof(fd_snapin_tile_t),  sizeof(fd_snapin_tile_t)                  );
+  l = FD_LAYOUT_APPEND( l, fd_snapshot_parser_align(), fd_snapshot_parser_footprint( 1UL<<24UL ) );
   return FD_LAYOUT_FINI( l, alignof(fd_snapin_tile_t) );
 }
 
@@ -86,16 +90,13 @@ metrics_write( fd_snapin_tile_t * ctx ) {
 }
 
 static void
-manifest_cb( void * _ctx,
-             ulong  manifest_sz ) {
+manifest_cb( void * _ctx ) {
   fd_snapin_tile_t * ctx = (fd_snapin_tile_t*)_ctx;
 
-  ulong sz = fd_ulong_align_up( sizeof(fd_snapshot_manifest_t), FD_SOLANA_MANIFEST_GLOBAL_ALIGN )+manifest_sz;
-  FD_TEST( sz<=ctx->manifest_out.mtu );
-  ulong sig = ctx->full ? fd_ssmsg_sig( FD_SSMSG_MANIFEST_FULL, manifest_sz ) :
-                          fd_ssmsg_sig( FD_SSMSG_MANIFEST_INCREMENTAL, manifest_sz );
-  fd_stem_publish( ctx->stem, 0UL, sig, ctx->manifest_out.chunk, sz, 0UL, 0UL, 0UL );
-  ctx->manifest_out.chunk = fd_dcache_compact_next( ctx->manifest_out.chunk, sz, ctx->manifest_out.chunk0, ctx->manifest_out.wmark );
+  ulong sig = ctx->full ? fd_ssmsg_sig( FD_SSMSG_MANIFEST_FULL ) :
+                          fd_ssmsg_sig( FD_SSMSG_MANIFEST_INCREMENTAL );
+  fd_stem_publish( ctx->stem, 0UL, sig, ctx->manifest_out.chunk, sizeof(fd_snapshot_manifest_t), 0UL, 0UL, 0UL );
+  ctx->manifest_out.chunk = fd_dcache_compact_next( ctx->manifest_out.chunk, sizeof(fd_snapshot_manifest_t), ctx->manifest_out.chunk0, ctx->manifest_out.wmark );
 }
 
 static int
@@ -129,22 +130,23 @@ account_cb( void *                          _ctx,
   }
 
   FD_TXN_ACCOUNT_DECL( rec );
+  fd_funk_rec_prepare_t prepare = {0};
   int err = fd_txn_account_init_from_funk_mutable( rec,
                                                    (fd_pubkey_t*)hdr->meta.pubkey,
                                                    ctx->funk,
                                                    ctx->funk_txn,
                                                    /* do_create */ 1,
-                                                   hdr->meta.data_len );
+                                                   hdr->meta.data_len,
+                                                   &prepare );
   if( FD_UNLIKELY( err!=FD_ACC_MGR_SUCCESS ) ) FD_LOG_ERR(( "fd_txn_account_init_from_funk_mutable failed (%d)", err ));
 
-  rec->vt->set_data_len( rec, hdr->meta.data_len );
-  rec->vt->set_slot( rec, ctx->ssparse->accv_slot );
-  rec->vt->set_hash( rec, &hdr->hash );
-  rec->vt->set_info( rec, &hdr->info );
+  fd_txn_account_set_data_len( rec, hdr->meta.data_len );
+  fd_txn_account_set_slot( rec, ctx->ssparse->accv_slot );
+  fd_txn_account_set_meta_info( rec, &hdr->info );
 
-  ctx->acc_data = rec->vt->get_data_mut( rec );
+  ctx->acc_data = fd_txn_account_get_data_mut( rec );
   ctx->metrics.accounts_inserted++;
-  fd_txn_account_mutable_fini( rec, ctx->funk, ctx->funk_txn );
+  fd_txn_account_mutable_fini( rec, ctx->funk, ctx->funk_txn, &prepare );
 }
 
 static void
@@ -246,7 +248,7 @@ handle_control_frag( fd_snapin_tile_t *  ctx,
       }
 
       if( FD_LIKELY( ctx->funk_txn ) ) fd_funk_txn_publish_into_parent( ctx->funk, ctx->funk_txn, 0 );
-      fd_stem_publish( stem, 0UL, fd_ssmsg_sig( FD_SSMSG_DONE, 0UL ), 0UL, 0UL, 0UL, 0UL, 0UL );
+      fd_stem_publish( stem, 0UL, fd_ssmsg_sig( FD_SSMSG_DONE ), 0UL, 0UL, 0UL, 0UL, 0UL );
       break;
     case FD_SNAPSHOT_MSG_CTRL_SHUTDOWN:
       ctx->state = FD_SNAPIN_STATE_SHUTDOWN;
@@ -274,7 +276,6 @@ returnable_frag( fd_snapin_tile_t *  ctx,
                  fd_stem_context_t * stem ) {
   (void)in_idx;
   (void)seq;
-  (void)sig;
   (void)tsorig;
   (void)tspub;
 
@@ -288,22 +289,35 @@ returnable_frag( fd_snapin_tile_t *  ctx,
   return 0;
 }
 
+static void
+privileged_init( fd_topo_t *      topo,
+                 fd_topo_tile_t * tile ) {
+  void * scratch = fd_topo_obj_laddr( topo, tile->tile_obj_id );
+
+  FD_SCRATCH_ALLOC_INIT( l, scratch );
+  fd_snapin_tile_t * ctx = FD_SCRATCH_ALLOC_APPEND( l, alignof(fd_snapin_tile_t), sizeof(fd_snapin_tile_t) );
+
+  FD_TEST( fd_rng_secure( &ctx->seed, 8UL ) );
+}
+
 FD_FN_UNUSED static void
 unprivileged_init( fd_topo_t *      topo,
                    fd_topo_tile_t * tile ) {
   void * scratch = fd_topo_obj_laddr( topo, tile->tile_obj_id );
 
   FD_SCRATCH_ALLOC_INIT( l, scratch );
-  fd_snapin_tile_t * ctx = FD_SCRATCH_ALLOC_APPEND( l, alignof(fd_snapin_tile_t),  sizeof(fd_snapin_tile_t) );
-  void * _ssparse        = FD_SCRATCH_ALLOC_APPEND( l, fd_snapshot_parser_align(), fd_snapshot_parser_footprint( ACCV_LG_SLOT_CNT ) );
+  fd_snapin_tile_t * ctx = FD_SCRATCH_ALLOC_APPEND( l, alignof(fd_snapin_tile_t),  sizeof(fd_snapin_tile_t)                  );
+  void * _ssparse        = FD_SCRATCH_ALLOC_APPEND( l, fd_snapshot_parser_align(), fd_snapshot_parser_footprint( 1UL<<24UL ) );
 
   ctx->full = 1;
   ctx->state = FD_SNAPIN_STATE_LOADING;
 
+  ctx->boot_timestamp = fd_log_wallclock();
+
   FD_TEST( fd_funk_join( ctx->funk, fd_topo_obj_laddr( topo, tile->snapin.funk_obj_id ) ) );
   ctx->funk_txn = fd_funk_txn_query( fd_funk_root( ctx->funk ), ctx->funk->txn_map );
 
-  ctx->ssparse = fd_snapshot_parser_new( _ssparse, ACCV_LG_SLOT_CNT, ctx, manifest_cb, account_cb, account_data_cb );
+  ctx->ssparse = fd_snapshot_parser_new( _ssparse, ctx, ctx->seed, 1UL<<24UL, manifest_cb, account_cb, account_data_cb );
 
   FD_TEST( ctx->ssparse );
 
@@ -346,6 +360,7 @@ fd_topo_run_tile_t fd_tile_snapin = {
   .name              = NAME,
   .scratch_align     = scratch_align,
   .scratch_footprint = scratch_footprint,
+  .privileged_init   = privileged_init,
   .unprivileged_init = unprivileged_init,
   .run               = stem_run,
 };

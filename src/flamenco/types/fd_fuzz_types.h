@@ -76,57 +76,6 @@ void *fd_fee_calculator_generate( void *mem, void **alloc_mem, fd_rng_t * rng ) 
   return mem;
 }
 
-void *fd_hash_age_generate( void *mem, void **alloc_mem, fd_rng_t * rng ) {
-  fd_hash_age_t *self = (fd_hash_age_t *) mem;
-  *alloc_mem = (uchar *) *alloc_mem + sizeof(fd_hash_age_t);
-  fd_hash_age_new(mem);
-  fd_fee_calculator_generate( &self->fee_calculator, alloc_mem, rng );
-  self->hash_index = fd_rng_ulong( rng );
-  self->timestamp = fd_rng_ulong( rng );
-  return mem;
-}
-
-void *fd_hash_hash_age_pair_generate( void *mem, void **alloc_mem, fd_rng_t * rng ) {
-  fd_hash_hash_age_pair_t *self = (fd_hash_hash_age_pair_t *) mem;
-  *alloc_mem = (uchar *) *alloc_mem + sizeof(fd_hash_hash_age_pair_t);
-  fd_hash_hash_age_pair_new(mem);
-  fd_hash_generate( &self->key, alloc_mem, rng );
-  fd_hash_age_generate( &self->val, alloc_mem, rng );
-  return mem;
-}
-
-void *fd_block_hash_vec_generate( void *mem, void **alloc_mem, fd_rng_t * rng ) {
-  fd_block_hash_vec_t *self = (fd_block_hash_vec_t *) mem;
-  *alloc_mem = (uchar *) *alloc_mem + sizeof(fd_block_hash_vec_t);
-  fd_block_hash_vec_new(mem);
-  self->last_hash_index = fd_rng_ulong( rng );
-  {
-    uchar is_null = fd_rng_uchar( rng ) % 2;
-    if( !is_null ) {
-      self->last_hash = (fd_hash_t *) *alloc_mem;
-      *alloc_mem = (uchar *) *alloc_mem + sizeof(fd_hash_t);
-      fd_hash_new( self->last_hash );
-      fd_hash_generate( self->last_hash, alloc_mem, rng );
-    }
-    else {
-    self->last_hash = NULL;
-    }
-  }
-  self->ages_len = fd_rng_ulong( rng ) % 8;
-  if( self->ages_len ) {
-    self->ages = (fd_hash_hash_age_pair_t *) *alloc_mem;
-    *alloc_mem = (uchar *) *alloc_mem + sizeof(fd_hash_hash_age_pair_t)*self->ages_len;
-    for( ulong i=0; i < self->ages_len; i++ ) {
-      fd_hash_hash_age_pair_new( self->ages + i );
-      fd_hash_hash_age_pair_generate( self->ages + i, alloc_mem, rng );
-    }
-  } else {
-    self->ages = NULL;
-  }
-  self->max_age = fd_rng_ulong( rng );
-  return mem;
-}
-
 void *fd_fee_rate_governor_generate( void *mem, void **alloc_mem, fd_rng_t * rng ) {
   fd_fee_rate_governor_t *self = (fd_fee_rate_governor_t *) mem;
   *alloc_mem = (uchar *) *alloc_mem + sizeof(fd_fee_rate_governor_t);
@@ -303,58 +252,8 @@ void *fd_account_meta_generate( void *mem, void **alloc_mem, fd_rng_t * rng ) {
   self->magic = fd_rng_ushort( rng );
   self->hlen = fd_rng_ushort( rng );
   self->dlen = fd_rng_ulong( rng );
-  LLVMFuzzerMutate( &self->hash[0], sizeof(self->hash), sizeof(self->hash) );
   self->slot = fd_rng_ulong( rng );
   fd_solana_account_meta_generate( &self->info, alloc_mem, rng );
-  return mem;
-}
-
-void *fd_vote_accounts_pair_generate( void *mem, void **alloc_mem, fd_rng_t * rng ) {
-  fd_vote_accounts_pair_t *self = (fd_vote_accounts_pair_t *) mem;
-  *alloc_mem = (uchar *) *alloc_mem + sizeof(fd_vote_accounts_pair_t);
-  fd_vote_accounts_pair_new(mem);
-  fd_pubkey_generate( &self->key, alloc_mem, rng );
-  self->stake = fd_rng_ulong( rng );
-  fd_solana_account_generate( &self->value, alloc_mem, rng );
-  return mem;
-}
-
-void *fd_vote_accounts_generate( void *mem, void **alloc_mem, fd_rng_t * rng ) {
-  fd_vote_accounts_t *self = (fd_vote_accounts_t *) mem;
-  *alloc_mem = (uchar *) *alloc_mem + sizeof(fd_vote_accounts_t);
-  fd_vote_accounts_new(mem);
-  ulong vote_accounts_len = fd_rng_ulong( rng ) % 8;
-  self->vote_accounts_pool = fd_vote_accounts_pair_t_map_join_new( alloc_mem, fd_ulong_max( vote_accounts_len, 50000 ) );
-  self->vote_accounts_root = NULL;
-  for( ulong i=0; i < vote_accounts_len; i++ ) {
-    fd_vote_accounts_pair_t_mapnode_t * node = fd_vote_accounts_pair_t_map_acquire( self->vote_accounts_pool );
-    fd_vote_accounts_pair_generate( &node->elem, alloc_mem, rng );
-    fd_vote_accounts_pair_t_map_insert( self->vote_accounts_pool, &self->vote_accounts_root, node );
-  }
-  return mem;
-}
-
-void *fd_account_keys_pair_generate( void *mem, void **alloc_mem, fd_rng_t * rng ) {
-  fd_account_keys_pair_t *self = (fd_account_keys_pair_t *) mem;
-  *alloc_mem = (uchar *) *alloc_mem + sizeof(fd_account_keys_pair_t);
-  fd_account_keys_pair_new(mem);
-  fd_pubkey_generate( &self->key, alloc_mem, rng );
-  self->exists = fd_rng_uchar( rng );
-  return mem;
-}
-
-void *fd_account_keys_generate( void *mem, void **alloc_mem, fd_rng_t * rng ) {
-  fd_account_keys_t *self = (fd_account_keys_t *) mem;
-  *alloc_mem = (uchar *) *alloc_mem + sizeof(fd_account_keys_t);
-  fd_account_keys_new(mem);
-  ulong account_keys_len = fd_rng_ulong( rng ) % 8;
-  self->account_keys_pool = fd_account_keys_pair_t_map_join_new( alloc_mem, fd_ulong_max( account_keys_len, 100000 ) );
-  self->account_keys_root = NULL;
-  for( ulong i=0; i < account_keys_len; i++ ) {
-    fd_account_keys_pair_t_mapnode_t * node = fd_account_keys_pair_t_map_acquire( self->account_keys_pool );
-    fd_account_keys_pair_generate( &node->elem, alloc_mem, rng );
-    fd_account_keys_pair_t_map_insert( self->account_keys_pool, &self->account_keys_root, node );
-  }
   return mem;
 }
 
@@ -370,15 +269,6 @@ void *fd_delegation_generate( void *mem, void **alloc_mem, fd_rng_t * rng ) {
   return mem;
 }
 
-void *fd_delegation_pair_generate( void *mem, void **alloc_mem, fd_rng_t * rng ) {
-  fd_delegation_pair_t *self = (fd_delegation_pair_t *) mem;
-  *alloc_mem = (uchar *) *alloc_mem + sizeof(fd_delegation_pair_t);
-  fd_delegation_pair_new(mem);
-  fd_pubkey_generate( &self->account, alloc_mem, rng );
-  fd_delegation_generate( &self->delegation, alloc_mem, rng );
-  return mem;
-}
-
 void *fd_stake_generate( void *mem, void **alloc_mem, fd_rng_t * rng ) {
   fd_stake_t *self = (fd_stake_t *) mem;
   *alloc_mem = (uchar *) *alloc_mem + sizeof(fd_stake_t);
@@ -388,409 +278,11 @@ void *fd_stake_generate( void *mem, void **alloc_mem, fd_rng_t * rng ) {
   return mem;
 }
 
-void *fd_stake_pair_generate( void *mem, void **alloc_mem, fd_rng_t * rng ) {
-  fd_stake_pair_t *self = (fd_stake_pair_t *) mem;
-  *alloc_mem = (uchar *) *alloc_mem + sizeof(fd_stake_pair_t);
-  fd_stake_pair_new(mem);
-  fd_pubkey_generate( &self->account, alloc_mem, rng );
-  fd_stake_generate( &self->stake, alloc_mem, rng );
-  return mem;
-}
-
-void *fd_stakes_generate( void *mem, void **alloc_mem, fd_rng_t * rng ) {
-  fd_stakes_t *self = (fd_stakes_t *) mem;
-  *alloc_mem = (uchar *) *alloc_mem + sizeof(fd_stakes_t);
-  fd_stakes_new(mem);
-  fd_vote_accounts_generate( &self->vote_accounts, alloc_mem, rng );
-  ulong stake_delegations_len = fd_rng_ulong( rng ) % 8;
-  self->stake_delegations_pool = fd_delegation_pair_t_map_join_new( alloc_mem, fd_ulong_max( stake_delegations_len, 2000000 ) );
-  self->stake_delegations_root = NULL;
-  for( ulong i=0; i < stake_delegations_len; i++ ) {
-    fd_delegation_pair_t_mapnode_t * node = fd_delegation_pair_t_map_acquire( self->stake_delegations_pool );
-    fd_delegation_pair_generate( &node->elem, alloc_mem, rng );
-    fd_delegation_pair_t_map_insert( self->stake_delegations_pool, &self->stake_delegations_root, node );
-  }
-  self->unused = fd_rng_ulong( rng );
-  self->epoch = fd_rng_ulong( rng );
-  fd_stake_history_generate( &self->stake_history, alloc_mem, rng );
-  return mem;
-}
-
-void *fd_stakes_stake_generate( void *mem, void **alloc_mem, fd_rng_t * rng ) {
-  fd_stakes_stake_t *self = (fd_stakes_stake_t *) mem;
-  *alloc_mem = (uchar *) *alloc_mem + sizeof(fd_stakes_stake_t);
-  fd_stakes_stake_new(mem);
-  fd_vote_accounts_generate( &self->vote_accounts, alloc_mem, rng );
-  ulong stake_delegations_len = fd_rng_ulong( rng ) % 8;
-  self->stake_delegations_pool = fd_stake_pair_t_map_join_new( alloc_mem, stake_delegations_len );
-  self->stake_delegations_root = NULL;
-  for( ulong i=0; i < stake_delegations_len; i++ ) {
-    fd_stake_pair_t_mapnode_t * node = fd_stake_pair_t_map_acquire( self->stake_delegations_pool );
-    fd_stake_pair_generate( &node->elem, alloc_mem, rng );
-    fd_stake_pair_t_map_insert( self->stake_delegations_pool, &self->stake_delegations_root, node );
-  }
-  self->unused = fd_rng_ulong( rng );
-  self->epoch = fd_rng_ulong( rng );
-  fd_stake_history_generate( &self->stake_history, alloc_mem, rng );
-  return mem;
-}
-
-void *fd_bank_incremental_snapshot_persistence_generate( void *mem, void **alloc_mem, fd_rng_t * rng ) {
-  fd_bank_incremental_snapshot_persistence_t *self = (fd_bank_incremental_snapshot_persistence_t *) mem;
-  *alloc_mem = (uchar *) *alloc_mem + sizeof(fd_bank_incremental_snapshot_persistence_t);
-  fd_bank_incremental_snapshot_persistence_new(mem);
-  self->full_slot = fd_rng_ulong( rng );
-  fd_hash_generate( &self->full_hash, alloc_mem, rng );
-  self->full_capitalization = fd_rng_ulong( rng );
-  fd_hash_generate( &self->incremental_hash, alloc_mem, rng );
-  self->incremental_capitalization = fd_rng_ulong( rng );
-  return mem;
-}
-
-void *fd_node_vote_accounts_generate( void *mem, void **alloc_mem, fd_rng_t * rng ) {
-  fd_node_vote_accounts_t *self = (fd_node_vote_accounts_t *) mem;
-  *alloc_mem = (uchar *) *alloc_mem + sizeof(fd_node_vote_accounts_t);
-  fd_node_vote_accounts_new(mem);
-  self->vote_accounts_len = fd_rng_ulong( rng ) % 8;
-  if( self->vote_accounts_len ) {
-    self->vote_accounts = (fd_pubkey_t *) *alloc_mem;
-    *alloc_mem = (uchar *) *alloc_mem + sizeof(fd_pubkey_t)*self->vote_accounts_len;
-    for( ulong i=0; i < self->vote_accounts_len; i++ ) {
-      fd_pubkey_new( self->vote_accounts + i );
-      fd_pubkey_generate( self->vote_accounts + i, alloc_mem, rng );
-    }
-  } else {
-    self->vote_accounts = NULL;
-  }
-  self->total_stake = fd_rng_ulong( rng );
-  return mem;
-}
-
-void *fd_pubkey_node_vote_accounts_pair_generate( void *mem, void **alloc_mem, fd_rng_t * rng ) {
-  fd_pubkey_node_vote_accounts_pair_t *self = (fd_pubkey_node_vote_accounts_pair_t *) mem;
-  *alloc_mem = (uchar *) *alloc_mem + sizeof(fd_pubkey_node_vote_accounts_pair_t);
-  fd_pubkey_node_vote_accounts_pair_new(mem);
-  fd_pubkey_generate( &self->key, alloc_mem, rng );
-  fd_node_vote_accounts_generate( &self->value, alloc_mem, rng );
-  return mem;
-}
-
-void *fd_pubkey_pubkey_pair_generate( void *mem, void **alloc_mem, fd_rng_t * rng ) {
-  fd_pubkey_pubkey_pair_t *self = (fd_pubkey_pubkey_pair_t *) mem;
-  *alloc_mem = (uchar *) *alloc_mem + sizeof(fd_pubkey_pubkey_pair_t);
-  fd_pubkey_pubkey_pair_new(mem);
-  fd_pubkey_generate( &self->key, alloc_mem, rng );
-  fd_pubkey_generate( &self->value, alloc_mem, rng );
-  return mem;
-}
-
-void *fd_epoch_stakes_generate( void *mem, void **alloc_mem, fd_rng_t * rng ) {
-  fd_epoch_stakes_t *self = (fd_epoch_stakes_t *) mem;
-  *alloc_mem = (uchar *) *alloc_mem + sizeof(fd_epoch_stakes_t);
-  fd_epoch_stakes_new(mem);
-  fd_stakes_generate( &self->stakes, alloc_mem, rng );
-  self->total_stake = fd_rng_ulong( rng );
-  ulong node_id_to_vote_accounts_len = fd_rng_ulong( rng ) % 8;
-  self->node_id_to_vote_accounts_pool = fd_pubkey_node_vote_accounts_pair_t_map_join_new( alloc_mem, node_id_to_vote_accounts_len );
-  self->node_id_to_vote_accounts_root = NULL;
-  for( ulong i=0; i < node_id_to_vote_accounts_len; i++ ) {
-    fd_pubkey_node_vote_accounts_pair_t_mapnode_t * node = fd_pubkey_node_vote_accounts_pair_t_map_acquire( self->node_id_to_vote_accounts_pool );
-    fd_pubkey_node_vote_accounts_pair_generate( &node->elem, alloc_mem, rng );
-    fd_pubkey_node_vote_accounts_pair_t_map_insert( self->node_id_to_vote_accounts_pool, &self->node_id_to_vote_accounts_root, node );
-  }
-  ulong epoch_authorized_voters_len = fd_rng_ulong( rng ) % 8;
-  self->epoch_authorized_voters_pool = fd_pubkey_pubkey_pair_t_map_join_new( alloc_mem, epoch_authorized_voters_len );
-  self->epoch_authorized_voters_root = NULL;
-  for( ulong i=0; i < epoch_authorized_voters_len; i++ ) {
-    fd_pubkey_pubkey_pair_t_mapnode_t * node = fd_pubkey_pubkey_pair_t_map_acquire( self->epoch_authorized_voters_pool );
-    fd_pubkey_pubkey_pair_generate( &node->elem, alloc_mem, rng );
-    fd_pubkey_pubkey_pair_t_map_insert( self->epoch_authorized_voters_pool, &self->epoch_authorized_voters_root, node );
-  }
-  return mem;
-}
-
-void *fd_epoch_epoch_stakes_pair_generate( void *mem, void **alloc_mem, fd_rng_t * rng ) {
-  fd_epoch_epoch_stakes_pair_t *self = (fd_epoch_epoch_stakes_pair_t *) mem;
-  *alloc_mem = (uchar *) *alloc_mem + sizeof(fd_epoch_epoch_stakes_pair_t);
-  fd_epoch_epoch_stakes_pair_new(mem);
-  self->key = fd_rng_ulong( rng );
-  fd_epoch_stakes_generate( &self->value, alloc_mem, rng );
-  return mem;
-}
-
-void *fd_pubkey_u64_pair_generate( void *mem, void **alloc_mem, fd_rng_t * rng ) {
-  fd_pubkey_u64_pair_t *self = (fd_pubkey_u64_pair_t *) mem;
-  *alloc_mem = (uchar *) *alloc_mem + sizeof(fd_pubkey_u64_pair_t);
-  fd_pubkey_u64_pair_new(mem);
-  fd_pubkey_generate( &self->_0, alloc_mem, rng );
-  self->_1 = fd_rng_ulong( rng );
-  return mem;
-}
-
-void *fd_unused_accounts_generate( void *mem, void **alloc_mem, fd_rng_t * rng ) {
-  fd_unused_accounts_t *self = (fd_unused_accounts_t *) mem;
-  *alloc_mem = (uchar *) *alloc_mem + sizeof(fd_unused_accounts_t);
-  fd_unused_accounts_new(mem);
-  self->unused1_len = fd_rng_ulong( rng ) % 8;
-  if( self->unused1_len ) {
-    self->unused1 = (fd_pubkey_t *) *alloc_mem;
-    *alloc_mem = (uchar *) *alloc_mem + sizeof(fd_pubkey_t)*self->unused1_len;
-    for( ulong i=0; i < self->unused1_len; i++ ) {
-      fd_pubkey_new( self->unused1 + i );
-      fd_pubkey_generate( self->unused1 + i, alloc_mem, rng );
-    }
-  } else {
-    self->unused1 = NULL;
-  }
-  self->unused2_len = fd_rng_ulong( rng ) % 8;
-  if( self->unused2_len ) {
-    self->unused2 = (fd_pubkey_t *) *alloc_mem;
-    *alloc_mem = (uchar *) *alloc_mem + sizeof(fd_pubkey_t)*self->unused2_len;
-    for( ulong i=0; i < self->unused2_len; i++ ) {
-      fd_pubkey_new( self->unused2 + i );
-      fd_pubkey_generate( self->unused2 + i, alloc_mem, rng );
-    }
-  } else {
-    self->unused2 = NULL;
-  }
-  self->unused3_len = fd_rng_ulong( rng ) % 8;
-  if( self->unused3_len ) {
-    self->unused3 = (fd_pubkey_u64_pair_t *) *alloc_mem;
-    *alloc_mem = (uchar *) *alloc_mem + sizeof(fd_pubkey_u64_pair_t)*self->unused3_len;
-    for( ulong i=0; i < self->unused3_len; i++ ) {
-      fd_pubkey_u64_pair_new( self->unused3 + i );
-      fd_pubkey_u64_pair_generate( self->unused3 + i, alloc_mem, rng );
-    }
-  } else {
-    self->unused3 = NULL;
-  }
-  return mem;
-}
-
-void *fd_versioned_bank_generate( void *mem, void **alloc_mem, fd_rng_t * rng ) {
-  fd_versioned_bank_t *self = (fd_versioned_bank_t *) mem;
-  *alloc_mem = (uchar *) *alloc_mem + sizeof(fd_versioned_bank_t);
-  fd_versioned_bank_new(mem);
-  fd_block_hash_vec_generate( &self->blockhash_queue, alloc_mem, rng );
-  self->ancestors_len = fd_rng_ulong( rng ) % 8;
-  if( self->ancestors_len ) {
-    self->ancestors = (fd_slot_pair_t *) *alloc_mem;
-    *alloc_mem = (uchar *) *alloc_mem + sizeof(fd_slot_pair_t)*self->ancestors_len;
-    for( ulong i=0; i < self->ancestors_len; i++ ) {
-      fd_slot_pair_new( self->ancestors + i );
-      fd_slot_pair_generate( self->ancestors + i, alloc_mem, rng );
-    }
-  } else {
-    self->ancestors = NULL;
-  }
-  fd_hash_generate( &self->hash, alloc_mem, rng );
-  fd_hash_generate( &self->parent_hash, alloc_mem, rng );
-  self->parent_slot = fd_rng_ulong( rng );
-  fd_hard_forks_generate( &self->hard_forks, alloc_mem, rng );
-  self->transaction_count = fd_rng_ulong( rng );
-  self->tick_height = fd_rng_ulong( rng );
-  self->signature_count = fd_rng_ulong( rng );
-  self->capitalization = fd_rng_ulong( rng );
-  self->max_tick_height = fd_rng_ulong( rng );
-  {
-    uchar is_null = fd_rng_uchar( rng ) % 2;
-    if( !is_null ) {
-      self->hashes_per_tick = (ulong *) *alloc_mem;
-      *alloc_mem = (uchar *) *alloc_mem + sizeof(ulong);
-      LLVMFuzzerMutate( (uchar *)self->hashes_per_tick, sizeof(ulong), sizeof(ulong) );
-    }
-    else {
-    self->hashes_per_tick = NULL;
-    }
-  }
-  self->ticks_per_slot = fd_rng_ulong( rng );
-  self->ns_per_slot = fd_rng_uint128( rng );
-  self->genesis_creation_time = fd_rng_ulong( rng );
-  self->slots_per_year = fd_rng_double_o( rng );
-  self->accounts_data_len = fd_rng_ulong( rng );
-  self->slot = fd_rng_ulong( rng );
-  self->epoch = fd_rng_ulong( rng );
-  self->block_height = fd_rng_ulong( rng );
-  fd_pubkey_generate( &self->collector_id, alloc_mem, rng );
-  self->collector_fees = fd_rng_ulong( rng );
-  fd_fee_calculator_generate( &self->fee_calculator, alloc_mem, rng );
-  fd_fee_rate_governor_generate( &self->fee_rate_governor, alloc_mem, rng );
-  self->collected_rent = fd_rng_ulong( rng );
-  fd_rent_collector_generate( &self->rent_collector, alloc_mem, rng );
-  fd_epoch_schedule_generate( &self->epoch_schedule, alloc_mem, rng );
-  fd_inflation_generate( &self->inflation, alloc_mem, rng );
-  fd_stakes_generate( &self->stakes, alloc_mem, rng );
-  fd_unused_accounts_generate( &self->unused_accounts, alloc_mem, rng );
-  self->epoch_stakes_len = fd_rng_ulong( rng ) % 8;
-  if( self->epoch_stakes_len ) {
-    self->epoch_stakes = (fd_epoch_epoch_stakes_pair_t *) *alloc_mem;
-    *alloc_mem = (uchar *) *alloc_mem + sizeof(fd_epoch_epoch_stakes_pair_t)*self->epoch_stakes_len;
-    for( ulong i=0; i < self->epoch_stakes_len; i++ ) {
-      fd_epoch_epoch_stakes_pair_new( self->epoch_stakes + i );
-      fd_epoch_epoch_stakes_pair_generate( self->epoch_stakes + i, alloc_mem, rng );
-    }
-  } else {
-    self->epoch_stakes = NULL;
-  }
-  self->is_delta = fd_rng_uchar( rng );
-  return mem;
-}
-
-void *fd_bank_hash_stats_generate( void *mem, void **alloc_mem, fd_rng_t * rng ) {
-  fd_bank_hash_stats_t *self = (fd_bank_hash_stats_t *) mem;
-  *alloc_mem = (uchar *) *alloc_mem + sizeof(fd_bank_hash_stats_t);
-  fd_bank_hash_stats_new(mem);
-  self->num_updated_accounts = fd_rng_ulong( rng );
-  self->num_removed_accounts = fd_rng_ulong( rng );
-  self->num_lamports_stored = fd_rng_ulong( rng );
-  self->total_data_len = fd_rng_ulong( rng );
-  self->num_executable_accounts = fd_rng_ulong( rng );
-  return mem;
-}
-
-void *fd_bank_hash_info_generate( void *mem, void **alloc_mem, fd_rng_t * rng ) {
-  fd_bank_hash_info_t *self = (fd_bank_hash_info_t *) mem;
-  *alloc_mem = (uchar *) *alloc_mem + sizeof(fd_bank_hash_info_t);
-  fd_bank_hash_info_new(mem);
-  fd_hash_generate( &self->accounts_delta_hash, alloc_mem, rng );
-  fd_hash_generate( &self->accounts_hash, alloc_mem, rng );
-  fd_bank_hash_stats_generate( &self->stats, alloc_mem, rng );
-  return mem;
-}
-
-void *fd_slot_map_pair_generate( void *mem, void **alloc_mem, fd_rng_t * rng ) {
-  fd_slot_map_pair_t *self = (fd_slot_map_pair_t *) mem;
-  *alloc_mem = (uchar *) *alloc_mem + sizeof(fd_slot_map_pair_t);
-  fd_slot_map_pair_new(mem);
-  self->slot = fd_rng_ulong( rng );
-  fd_hash_generate( &self->hash, alloc_mem, rng );
-  return mem;
-}
-
-void *fd_snapshot_acc_vec_generate( void *mem, void **alloc_mem, fd_rng_t * rng ) {
-  fd_snapshot_acc_vec_t *self = (fd_snapshot_acc_vec_t *) mem;
-  *alloc_mem = (uchar *) *alloc_mem + sizeof(fd_snapshot_acc_vec_t);
-  fd_snapshot_acc_vec_new(mem);
-  self->id = fd_rng_ulong( rng );
-  self->file_sz = fd_rng_ulong( rng );
-  return mem;
-}
-
-void *fd_snapshot_slot_acc_vecs_generate( void *mem, void **alloc_mem, fd_rng_t * rng ) {
-  fd_snapshot_slot_acc_vecs_t *self = (fd_snapshot_slot_acc_vecs_t *) mem;
-  *alloc_mem = (uchar *) *alloc_mem + sizeof(fd_snapshot_slot_acc_vecs_t);
-  fd_snapshot_slot_acc_vecs_new(mem);
-  self->slot = fd_rng_ulong( rng );
-  self->account_vecs_len = fd_rng_ulong( rng ) % 8;
-  if( self->account_vecs_len ) {
-    self->account_vecs = (fd_snapshot_acc_vec_t *) *alloc_mem;
-    *alloc_mem = (uchar *) *alloc_mem + sizeof(fd_snapshot_acc_vec_t)*self->account_vecs_len;
-    for( ulong i=0; i < self->account_vecs_len; i++ ) {
-      fd_snapshot_acc_vec_new( self->account_vecs + i );
-      fd_snapshot_acc_vec_generate( self->account_vecs + i, alloc_mem, rng );
-    }
-  } else {
-    self->account_vecs = NULL;
-  }
-  return mem;
-}
-
 void *fd_reward_type_generate( void *mem, void **alloc_mem, fd_rng_t * rng ) {
   fd_reward_type_t *self = (fd_reward_type_t *) mem;
   *alloc_mem = (uchar *) *alloc_mem + sizeof(fd_reward_type_t);
   fd_reward_type_new(mem);
   self->discriminant = fd_rng_uint( rng ) % 4;
-  return mem;
-}
-
-void *fd_solana_accounts_db_fields_generate( void *mem, void **alloc_mem, fd_rng_t * rng ) {
-  fd_solana_accounts_db_fields_t *self = (fd_solana_accounts_db_fields_t *) mem;
-  *alloc_mem = (uchar *) *alloc_mem + sizeof(fd_solana_accounts_db_fields_t);
-  fd_solana_accounts_db_fields_new(mem);
-  self->storages_len = fd_rng_ulong( rng ) % 8;
-  if( self->storages_len ) {
-    self->storages = (fd_snapshot_slot_acc_vecs_t *) *alloc_mem;
-    *alloc_mem = (uchar *) *alloc_mem + sizeof(fd_snapshot_slot_acc_vecs_t)*self->storages_len;
-    for( ulong i=0; i < self->storages_len; i++ ) {
-      fd_snapshot_slot_acc_vecs_new( self->storages + i );
-      fd_snapshot_slot_acc_vecs_generate( self->storages + i, alloc_mem, rng );
-    }
-  } else {
-    self->storages = NULL;
-  }
-  self->version = fd_rng_ulong( rng );
-  self->slot = fd_rng_ulong( rng );
-  fd_bank_hash_info_generate( &self->bank_hash_info, alloc_mem, rng );
-  self->historical_roots_len = fd_rng_ulong( rng ) % 8;
-  if( self->historical_roots_len ) {
-    self->historical_roots = (ulong *) *alloc_mem;
-    *alloc_mem = (uchar *) *alloc_mem + sizeof(ulong)*self->historical_roots_len;
-    LLVMFuzzerMutate( (uchar *) self->historical_roots, sizeof(ulong)*self->historical_roots_len, sizeof(ulong)*self->historical_roots_len );
-  } else {
-    self->historical_roots = NULL;
-  }
-  self->historical_roots_with_hash_len = fd_rng_ulong( rng ) % 8;
-  if( self->historical_roots_with_hash_len ) {
-    self->historical_roots_with_hash = (fd_slot_map_pair_t *) *alloc_mem;
-    *alloc_mem = (uchar *) *alloc_mem + sizeof(fd_slot_map_pair_t)*self->historical_roots_with_hash_len;
-    for( ulong i=0; i < self->historical_roots_with_hash_len; i++ ) {
-      fd_slot_map_pair_new( self->historical_roots_with_hash + i );
-      fd_slot_map_pair_generate( self->historical_roots_with_hash + i, alloc_mem, rng );
-    }
-  } else {
-    self->historical_roots_with_hash = NULL;
-  }
-  return mem;
-}
-
-void *fd_versioned_epoch_stakes_current_generate( void *mem, void **alloc_mem, fd_rng_t * rng ) {
-  fd_versioned_epoch_stakes_current_t *self = (fd_versioned_epoch_stakes_current_t *) mem;
-  *alloc_mem = (uchar *) *alloc_mem + sizeof(fd_versioned_epoch_stakes_current_t);
-  fd_versioned_epoch_stakes_current_new(mem);
-  fd_stakes_stake_generate( &self->stakes, alloc_mem, rng );
-  self->total_stake = fd_rng_ulong( rng );
-  ulong node_id_to_vote_accounts_len = fd_rng_ulong( rng ) % 8;
-  self->node_id_to_vote_accounts_pool = fd_pubkey_node_vote_accounts_pair_t_map_join_new( alloc_mem, node_id_to_vote_accounts_len );
-  self->node_id_to_vote_accounts_root = NULL;
-  for( ulong i=0; i < node_id_to_vote_accounts_len; i++ ) {
-    fd_pubkey_node_vote_accounts_pair_t_mapnode_t * node = fd_pubkey_node_vote_accounts_pair_t_map_acquire( self->node_id_to_vote_accounts_pool );
-    fd_pubkey_node_vote_accounts_pair_generate( &node->elem, alloc_mem, rng );
-    fd_pubkey_node_vote_accounts_pair_t_map_insert( self->node_id_to_vote_accounts_pool, &self->node_id_to_vote_accounts_root, node );
-  }
-  ulong epoch_authorized_voters_len = fd_rng_ulong( rng ) % 8;
-  self->epoch_authorized_voters_pool = fd_pubkey_pubkey_pair_t_map_join_new( alloc_mem, epoch_authorized_voters_len );
-  self->epoch_authorized_voters_root = NULL;
-  for( ulong i=0; i < epoch_authorized_voters_len; i++ ) {
-    fd_pubkey_pubkey_pair_t_mapnode_t * node = fd_pubkey_pubkey_pair_t_map_acquire( self->epoch_authorized_voters_pool );
-    fd_pubkey_pubkey_pair_generate( &node->elem, alloc_mem, rng );
-    fd_pubkey_pubkey_pair_t_map_insert( self->epoch_authorized_voters_pool, &self->epoch_authorized_voters_root, node );
-  }
-  return mem;
-}
-
-void fd_versioned_epoch_stakes_inner_generate( fd_versioned_epoch_stakes_inner_t * self, void **alloc_mem, uint discriminant, fd_rng_t * rng ) {
-  switch (discriminant) {
-  case 0: {
-    fd_versioned_epoch_stakes_current_generate( &self->Current, alloc_mem, rng );
-    break;
-  }
-  }
-}
-void *fd_versioned_epoch_stakes_generate( void *mem, void **alloc_mem, fd_rng_t * rng ) {
-  fd_versioned_epoch_stakes_t *self = (fd_versioned_epoch_stakes_t *) mem;
-  *alloc_mem = (uchar *) *alloc_mem + sizeof(fd_versioned_epoch_stakes_t);
-  fd_versioned_epoch_stakes_new(mem);
-  self->discriminant = fd_rng_uint( rng ) % 1;
-  fd_versioned_epoch_stakes_inner_generate( &self->inner, alloc_mem, self->discriminant, rng );
-  return mem;
-}
-
-void *fd_versioned_epoch_stakes_pair_generate( void *mem, void **alloc_mem, fd_rng_t * rng ) {
-  fd_versioned_epoch_stakes_pair_t *self = (fd_versioned_epoch_stakes_pair_t *) mem;
-  *alloc_mem = (uchar *) *alloc_mem + sizeof(fd_versioned_epoch_stakes_pair_t);
-  fd_versioned_epoch_stakes_pair_new(mem);
-  self->epoch = fd_rng_ulong( rng );
-  fd_versioned_epoch_stakes_generate( &self->val, alloc_mem, rng );
   return mem;
 }
 
@@ -813,63 +305,6 @@ void *fd_slot_lthash_generate( void *mem, void **alloc_mem, fd_rng_t * rng ) {
   return mem;
 }
 
-void *fd_solana_manifest_generate( void *mem, void **alloc_mem, fd_rng_t * rng ) {
-  fd_solana_manifest_t *self = (fd_solana_manifest_t *) mem;
-  *alloc_mem = (uchar *) *alloc_mem + sizeof(fd_solana_manifest_t);
-  fd_solana_manifest_new(mem);
-  fd_versioned_bank_generate( &self->bank, alloc_mem, rng );
-  fd_solana_accounts_db_fields_generate( &self->accounts_db, alloc_mem, rng );
-  self->lamports_per_signature = fd_rng_ulong( rng );
-  {
-    uchar is_null = fd_rng_uchar( rng ) % 2;
-    if( !is_null ) {
-      self->bank_incremental_snapshot_persistence = (fd_bank_incremental_snapshot_persistence_t *) *alloc_mem;
-      *alloc_mem = (uchar *) *alloc_mem + sizeof(fd_bank_incremental_snapshot_persistence_t);
-      fd_bank_incremental_snapshot_persistence_new( self->bank_incremental_snapshot_persistence );
-      fd_bank_incremental_snapshot_persistence_generate( self->bank_incremental_snapshot_persistence, alloc_mem, rng );
-    }
-    else {
-    self->bank_incremental_snapshot_persistence = NULL;
-    }
-  }
-  {
-    uchar is_null = fd_rng_uchar( rng ) % 2;
-    if( !is_null ) {
-      self->epoch_account_hash = (fd_hash_t *) *alloc_mem;
-      *alloc_mem = (uchar *) *alloc_mem + sizeof(fd_hash_t);
-      fd_hash_new( self->epoch_account_hash );
-      fd_hash_generate( self->epoch_account_hash, alloc_mem, rng );
-    }
-    else {
-    self->epoch_account_hash = NULL;
-    }
-  }
-  self->versioned_epoch_stakes_len = fd_rng_ulong( rng ) % 8;
-  if( self->versioned_epoch_stakes_len ) {
-    self->versioned_epoch_stakes = (fd_versioned_epoch_stakes_pair_t *) *alloc_mem;
-    *alloc_mem = (uchar *) *alloc_mem + sizeof(fd_versioned_epoch_stakes_pair_t)*self->versioned_epoch_stakes_len;
-    for( ulong i=0; i < self->versioned_epoch_stakes_len; i++ ) {
-      fd_versioned_epoch_stakes_pair_new( self->versioned_epoch_stakes + i );
-      fd_versioned_epoch_stakes_pair_generate( self->versioned_epoch_stakes + i, alloc_mem, rng );
-    }
-  } else {
-    self->versioned_epoch_stakes = NULL;
-  }
-  {
-    uchar is_null = fd_rng_uchar( rng ) % 2;
-    if( !is_null ) {
-      self->lthash = (fd_slot_lthash_t *) *alloc_mem;
-      *alloc_mem = (uchar *) *alloc_mem + sizeof(fd_slot_lthash_t);
-      fd_slot_lthash_new( self->lthash );
-      fd_slot_lthash_generate( self->lthash, alloc_mem, rng );
-    }
-    else {
-    self->lthash = NULL;
-    }
-  }
-  return mem;
-}
-
 void *fd_rust_duration_generate( void *mem, void **alloc_mem, fd_rng_t * rng ) {
   fd_rust_duration_t *self = (fd_rust_duration_t *) mem;
   *alloc_mem = (uchar *) *alloc_mem + sizeof(fd_rust_duration_t);
@@ -885,14 +320,9 @@ void *fd_poh_config_generate( void *mem, void **alloc_mem, fd_rng_t * rng ) {
   fd_poh_config_new(mem);
   fd_rust_duration_generate( &self->target_tick_duration, alloc_mem, rng );
   {
-    uchar is_null = fd_rng_uchar( rng ) % 2;
-    if( !is_null ) {
-      self->target_tick_count = (ulong *) *alloc_mem;
-      *alloc_mem = (uchar *) *alloc_mem + sizeof(ulong);
-      LLVMFuzzerMutate( (uchar *)self->target_tick_count, sizeof(ulong), sizeof(ulong) );
-    }
-    else {
-    self->target_tick_count = NULL;
+    self->has_target_tick_count = fd_rng_uchar( rng ) % 2;
+    if( self->has_target_tick_count ) {
+      LLVMFuzzerMutate( (uchar *)&(self->target_tick_count), sizeof(ulong), sizeof(ulong) );
     }
   }
   {
@@ -1743,14 +1173,9 @@ void *fd_vote_generate( void *mem, void **alloc_mem, fd_rng_t * rng ) {
   }
   fd_hash_generate( &self->hash, alloc_mem, rng );
   {
-    uchar is_null = fd_rng_uchar( rng ) % 2;
-    if( !is_null ) {
-      self->timestamp = (long *) *alloc_mem;
-      *alloc_mem = (uchar *) *alloc_mem + sizeof(long);
-      LLVMFuzzerMutate( (uchar *)self->timestamp, sizeof(long), sizeof(long) );
-    }
-    else {
-    self->timestamp = NULL;
+    self->has_timestamp = fd_rng_uchar( rng ) % 2;
+    if( self->has_timestamp ) {
+      LLVMFuzzerMutate( (uchar *)&(self->timestamp), sizeof(long), sizeof(long) );
     }
   }
   return mem;
@@ -2615,15 +2040,9 @@ void *fd_bpf_upgradeable_loader_state_buffer_generate( void *mem, void **alloc_m
   *alloc_mem = (uchar *) *alloc_mem + sizeof(fd_bpf_upgradeable_loader_state_buffer_t);
   fd_bpf_upgradeable_loader_state_buffer_new(mem);
   {
-    uchar is_null = fd_rng_uchar( rng ) % 2;
-    if( !is_null ) {
-      self->authority_address = (fd_pubkey_t *) *alloc_mem;
-      *alloc_mem = (uchar *) *alloc_mem + sizeof(fd_pubkey_t);
-      fd_pubkey_new( self->authority_address );
-      fd_pubkey_generate( self->authority_address, alloc_mem, rng );
-    }
-    else {
-    self->authority_address = NULL;
+    self->has_authority_address = fd_rng_uchar( rng ) % 2;
+    if( self->has_authority_address ) {
+      fd_pubkey_generate( &self->authority_address, alloc_mem, rng );
     }
   }
   return mem;
@@ -2643,15 +2062,9 @@ void *fd_bpf_upgradeable_loader_state_program_data_generate( void *mem, void **a
   fd_bpf_upgradeable_loader_state_program_data_new(mem);
   self->slot = fd_rng_ulong( rng );
   {
-    uchar is_null = fd_rng_uchar( rng ) % 2;
-    if( !is_null ) {
-      self->upgrade_authority_address = (fd_pubkey_t *) *alloc_mem;
-      *alloc_mem = (uchar *) *alloc_mem + sizeof(fd_pubkey_t);
-      fd_pubkey_new( self->upgrade_authority_address );
-      fd_pubkey_generate( self->upgrade_authority_address, alloc_mem, rng );
-    }
-    else {
-    self->upgrade_authority_address = NULL;
+    self->has_upgrade_authority_address = fd_rng_uchar( rng ) % 2;
+    if( self->has_upgrade_authority_address ) {
+      fd_pubkey_generate( &self->upgrade_authority_address, alloc_mem, rng );
     }
   }
   return mem;
@@ -2918,10 +2331,10 @@ void *fd_gossip_contact_info_v1_generate( void *mem, void **alloc_mem, fd_rng_t 
   return mem;
 }
 
-void *fd_gossip_vote_generate( void *mem, void **alloc_mem, fd_rng_t * rng ) {
-  fd_gossip_vote_t *self = (fd_gossip_vote_t *) mem;
-  *alloc_mem = (uchar *) *alloc_mem + sizeof(fd_gossip_vote_t);
-  fd_gossip_vote_new(mem);
+void *fd_gossip_vote_old_generate( void *mem, void **alloc_mem, fd_rng_t * rng ) {
+  fd_gossip_vote_old_t *self = (fd_gossip_vote_old_t *) mem;
+  *alloc_mem = (uchar *) *alloc_mem + sizeof(fd_gossip_vote_old_t);
+  fd_gossip_vote_old_new(mem);
   self->index = fd_rng_uchar( rng );
   fd_pubkey_generate( &self->from, alloc_mem, rng );
   fd_flamenco_txn_generate( &self->txn, alloc_mem, rng );
@@ -3150,10 +2563,10 @@ void *fd_gossip_node_instance_generate( void *mem, void **alloc_mem, fd_rng_t * 
   return mem;
 }
 
-void *fd_gossip_duplicate_shred_generate( void *mem, void **alloc_mem, fd_rng_t * rng ) {
-  fd_gossip_duplicate_shred_t *self = (fd_gossip_duplicate_shred_t *) mem;
-  *alloc_mem = (uchar *) *alloc_mem + sizeof(fd_gossip_duplicate_shred_t);
-  fd_gossip_duplicate_shred_new(mem);
+void *fd_gossip_duplicate_shred_old_generate( void *mem, void **alloc_mem, fd_rng_t * rng ) {
+  fd_gossip_duplicate_shred_old_t *self = (fd_gossip_duplicate_shred_old_t *) mem;
+  *alloc_mem = (uchar *) *alloc_mem + sizeof(fd_gossip_duplicate_shred_old_t);
+  fd_gossip_duplicate_shred_old_new(mem);
   self->duplicate_shred_index = fd_rng_ushort( rng );
   fd_pubkey_generate( &self->from, alloc_mem, rng );
   self->wallclock = fd_rng_ulong( rng );
@@ -3349,7 +2762,7 @@ void fd_crds_data_inner_generate( fd_crds_data_inner_t * self, void **alloc_mem,
     break;
   }
   case 1: {
-    fd_gossip_vote_generate( &self->vote, alloc_mem, rng );
+    fd_gossip_vote_old_generate( &self->vote, alloc_mem, rng );
     break;
   }
   case 2: {
@@ -3381,7 +2794,7 @@ void fd_crds_data_inner_generate( fd_crds_data_inner_t * self, void **alloc_mem,
     break;
   }
   case 9: {
-    fd_gossip_duplicate_shred_generate( &self->duplicate_shred, alloc_mem, rng );
+    fd_gossip_duplicate_shred_old_generate( &self->duplicate_shred, alloc_mem, rng );
     break;
   }
   case 10: {
@@ -3869,25 +3282,6 @@ void *fd_pubkey_rewardinfo_pair_generate( void *mem, void **alloc_mem, fd_rng_t 
   return mem;
 }
 
-void *fd_optional_account_generate( void *mem, void **alloc_mem, fd_rng_t * rng ) {
-  fd_optional_account_t *self = (fd_optional_account_t *) mem;
-  *alloc_mem = (uchar *) *alloc_mem + sizeof(fd_optional_account_t);
-  fd_optional_account_new(mem);
-  {
-    uchar is_null = fd_rng_uchar( rng ) % 2;
-    if( !is_null ) {
-      self->account = (fd_solana_account_t *) *alloc_mem;
-      *alloc_mem = (uchar *) *alloc_mem + sizeof(fd_solana_account_t);
-      fd_solana_account_new( self->account );
-      fd_solana_account_generate( self->account, alloc_mem, rng );
-    }
-    else {
-    self->account = NULL;
-    }
-  }
-  return mem;
-}
-
 void *fd_calculated_stake_points_generate( void *mem, void **alloc_mem, fd_rng_t * rng ) {
   fd_calculated_stake_points_t *self = (fd_calculated_stake_points_t *) mem;
   *alloc_mem = (uchar *) *alloc_mem + sizeof(fd_calculated_stake_points_t);
@@ -3937,42 +3331,6 @@ void *fd_epoch_info_pair_generate( void *mem, void **alloc_mem, fd_rng_t * rng )
   fd_epoch_info_pair_new(mem);
   fd_pubkey_generate( &self->account, alloc_mem, rng );
   fd_stake_generate( &self->stake, alloc_mem, rng );
-  return mem;
-}
-
-void *fd_vote_info_pair_generate( void *mem, void **alloc_mem, fd_rng_t * rng ) {
-  fd_vote_info_pair_t *self = (fd_vote_info_pair_t *) mem;
-  *alloc_mem = (uchar *) *alloc_mem + sizeof(fd_vote_info_pair_t);
-  fd_vote_info_pair_new(mem);
-  fd_pubkey_generate( &self->account, alloc_mem, rng );
-  fd_vote_state_versioned_generate( &self->state, alloc_mem, rng );
-  return mem;
-}
-
-void *fd_epoch_info_generate( void *mem, void **alloc_mem, fd_rng_t * rng ) {
-  fd_epoch_info_t *self = (fd_epoch_info_t *) mem;
-  *alloc_mem = (uchar *) *alloc_mem + sizeof(fd_epoch_info_t);
-  fd_epoch_info_new(mem);
-  self->stake_infos_len = fd_rng_ulong( rng ) % 8;
-  if( self->stake_infos_len ) {
-    self->stake_infos = (fd_epoch_info_pair_t *) *alloc_mem;
-    *alloc_mem = (uchar *) *alloc_mem + sizeof(fd_epoch_info_pair_t)*self->stake_infos_len;
-    for( ulong i=0; i < self->stake_infos_len; i++ ) {
-      fd_epoch_info_pair_new( self->stake_infos + i );
-      fd_epoch_info_pair_generate( self->stake_infos + i, alloc_mem, rng );
-    }
-  } else {
-    self->stake_infos = NULL;
-  }
-  ulong vote_states_len = fd_rng_ulong( rng ) % 8;
-  self->vote_states_pool = fd_vote_info_pair_t_map_join_new( alloc_mem, vote_states_len );
-  self->vote_states_root = NULL;
-  for( ulong i=0; i < vote_states_len; i++ ) {
-    fd_vote_info_pair_t_mapnode_t * node = fd_vote_info_pair_t_map_acquire( self->vote_states_pool );
-    fd_vote_info_pair_generate( &node->elem, alloc_mem, rng );
-    fd_vote_info_pair_t_map_insert( self->vote_states_pool, &self->vote_states_root, node );
-  }
-  self->stake_infos_new_keys_start_idx = fd_rng_ulong( rng );
   return mem;
 }
 

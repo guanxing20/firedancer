@@ -480,12 +480,6 @@ fd_quic_init( fd_quic_t * quic ) {
     /* used for indexing */
     conn->conn_idx = (uint)j;
 
-    conn->svc_type = UINT_MAX;
-    conn->svc_next = conn->svc_prev = UINT_MAX;
-    /* start with minimum supported max datagram */
-    /* peers may allow more */
-    conn->tx_max_datagram_sz = FD_QUIC_INITIAL_PAYLOAD_SZ_MAX;
-
     /* add to free list */
     *fd_ptr_if( last!=NULL, &last->svc_next, &state->free_conn_list ) = (uint)j;
 
@@ -552,9 +546,7 @@ fd_quic_init( fd_quic_t * quic ) {
   state->hs_pool = hs_pool;
 
   /* State: Initialize TLS handshake cache */
-  if( FD_LIKELY( !fd_quic_tls_hs_cache_join(
-    fd_quic_tls_hs_cache_new( &state->hs_cache )
-  ))) {
+  if( FD_UNLIKELY( !fd_quic_tls_hs_cache_join( fd_quic_tls_hs_cache_new( &state->hs_cache ) ) ) ) {
     FD_LOG_WARNING(( "fd_quic_tls_hs_cache_new failed" ));
     return NULL;
   }
@@ -694,9 +686,10 @@ fd_quic_svc_schedule( fd_quic_state_t * state,
     FD_LOG_ERR(( "fd_quic_svc_schedule called with invalid conn" ));
   }
 
-  int  is_queued = conn->svc_type < FD_QUIC_SVC_CNT;
-  long cur_delay = (long)conn->svc_time - (long)state->now;
-  long tgt_delay = (long)state->svc_delay[ svc_type ];
+  int  is_queued   = conn->svc_type < FD_QUIC_SVC_CNT;
+  long cur_delay   = (long)conn->svc_time - (long)state->now;
+  long time_to_max = LONG_MAX - (long)state->now;
+  long tgt_delay   = fd_long_if( svc_type==FD_QUIC_SVC_TIMEOUT, time_to_max, (long)state->svc_delay[ svc_type ] );
 
   /* Don't reschedule if already scheduled sooner */
   if( is_queued && cur_delay<=tgt_delay ) return;
@@ -743,13 +736,12 @@ fd_quic_svc_queue_validate( fd_quic_t * quic,
     FD_TEST( conn->svc_type == svc_type );
     FD_TEST( conn->svc_time <= now + state->svc_delay[ svc_type ] );
     FD_TEST( conn->svc_prev == prev );
+    FD_TEST( cnt < quic->limits.conn_cnt );
+
     conn->visited = 1U;
-
-    prev = node;
-    node = conn->svc_next;
+    prev          = node;
+    node          = conn->svc_next;
     cnt++;
-    FD_TEST( cnt <= quic->limits.conn_cnt );
-
   }
   FD_TEST( prev == state->svc_queue[ svc_type ].head );
 }
@@ -834,6 +826,30 @@ fd_quic_log_full_hdr( fd_quic_conn_t const * conn,
     .flags     = 0
   };
   return hdr;
+}
+
+static inline void
+fd_quic_set_conn_state( fd_quic_conn_t * conn,
+                        uint             new_state ) {
+
+  uint old_state = conn->state;
+
+  FD_COMPILER_MFENCE();
+
+  int was_timed_out = !!(old_state == FD_QUIC_CONN_STATE_TIMED_OUT);
+  int freeing       = was_timed_out & !!(new_state == FD_QUIC_CONN_STATE_INVALID);
+  int reviving      = was_timed_out & !freeing & !(new_state == FD_QUIC_CONN_STATE_TIMED_OUT);
+
+  fd_quic_metrics_t * metrics = &conn->quic->metrics;
+  metrics->conn_timeout_freed_cnt   += (ulong)freeing;
+  metrics->conn_timeout_revived_cnt += (ulong)reviving;
+
+  metrics->conn_state_cnt[ old_state ]--;
+  metrics->conn_state_cnt[ new_state ]++;
+
+  conn->state = new_state;
+
+  FD_COMPILER_MFENCE();
 }
 
 /* fd_quic_conn_error sets the connection state to aborted.  This does
@@ -1173,6 +1189,7 @@ fd_quic_conn_new_stream( fd_quic_conn_t * conn ) {
   if( FD_UNLIKELY( !entry ) ) {
     /* return stream to pool */
     fd_quic_stream_pool_free( state->stream_pool, stream );
+    FD_LOG_INFO(( "stream map insert failed" ));
     return NULL;
   }
 
@@ -1319,7 +1336,40 @@ fd_quic_conn_set_rx_max_data( fd_quic_conn_t * conn, ulong rx_max_data ) {
 
 /* packet processing */
 
-/* fd_quic_abandon_enc_level frees all resources associated encryption
+/* fd_quic_conn_free_pkt_meta frees all pkt_meta associated with
+   encryption levels less or equal to enc_level. Returns the number
+   of freed pkt_meta. */
+static ulong
+fd_quic_conn_free_pkt_meta( fd_quic_conn_t * conn,
+                            uint             enc_level ) {
+    ulong                        freed   = 0UL;
+    fd_quic_pkt_meta_tracker_t * tracker = &conn->pkt_meta_tracker;
+    fd_quic_pkt_meta_t         * pool    = tracker->pool;
+
+    for( uint j=0; j<=enc_level; ++j ) {
+      fd_quic_pkt_meta_ds_t * sent = &tracker->sent_pkt_metas[j];
+      fd_quic_pkt_meta_t    * prev = NULL;
+      for( fd_quic_pkt_meta_ds_fwd_iter_t iter = fd_quic_pkt_meta_ds_fwd_iter_init( sent, pool );
+                                                 !fd_quic_pkt_meta_ds_fwd_iter_done( iter );
+                                                 iter = fd_quic_pkt_meta_ds_fwd_iter_next( iter, pool ) ) {
+        fd_quic_pkt_meta_t * e = fd_quic_pkt_meta_ds_fwd_iter_ele( iter, pool );
+        if( FD_LIKELY( prev ) ) {
+          fd_quic_pkt_meta_pool_ele_release( pool, prev );
+        }
+        prev = e;
+      }
+      if( FD_LIKELY( prev ) ) {
+        fd_quic_pkt_meta_pool_ele_release( pool, prev );
+      }
+
+      conn->used_pkt_meta -= fd_quic_pkt_meta_ds_ele_cnt( sent );
+      freed               += fd_quic_pkt_meta_ds_ele_cnt( sent );
+      fd_quic_pkt_meta_ds_clear( tracker, j );
+    }
+    return freed;
+  }
+
+  /* fd_quic_abandon_enc_level frees all resources associated encryption
    levels less or equal to enc_level. Returns the number of freed
    pkt_meta. */
 
@@ -1329,7 +1379,6 @@ fd_quic_abandon_enc_level( fd_quic_conn_t * conn,
   if( FD_LIKELY( !fd_uint_extract_bit( conn->keys_avail, (int)enc_level ) ) ) return 0UL;
   FD_DEBUG( FD_LOG_DEBUG(( "conn=%p abandoning enc_level=%u", (void *)conn, enc_level )); )
 
-  ulong freed = 0UL;
 
   fd_quic_ack_gen_abandon_enc_level( conn->ack_gen, enc_level );
 
@@ -1341,27 +1390,15 @@ fd_quic_abandon_enc_level( fd_quic_conn_t * conn,
     /* treat all packets as ACKed (freeing handshake data, etc.) */
     fd_quic_pkt_meta_ds_t * sent  =  &tracker->sent_pkt_metas[j];
 
-    fd_quic_pkt_meta_t * prev = NULL;
-    for( fd_quic_pkt_meta_ds_fwd_iter_t iter = fd_quic_pkt_meta_treap_fwd_iter_init( sent, pool );
+    for( fd_quic_pkt_meta_ds_fwd_iter_t iter = fd_quic_pkt_meta_ds_fwd_iter_init( sent, pool );
                                                !fd_quic_pkt_meta_ds_fwd_iter_done( iter );
                                                iter = fd_quic_pkt_meta_ds_fwd_iter_next( iter, pool ) ) {
       fd_quic_pkt_meta_t * e = fd_quic_pkt_meta_ds_fwd_iter_ele( iter, pool );
-      if( FD_LIKELY( prev ) ) {
-        fd_quic_pkt_meta_pool_ele_release( pool, prev );
-      }
       fd_quic_reclaim_pkt_meta( conn, e, j );
-      prev = e;
     }
-    if( FD_LIKELY( prev ) ) {
-      fd_quic_pkt_meta_pool_ele_release( pool, prev );
-    }
-
-    freed               += fd_quic_pkt_meta_ds_ele_cnt( sent );
-    conn->used_pkt_meta -= fd_quic_pkt_meta_ds_ele_cnt( sent );
-    fd_quic_pkt_meta_ds_clear( tracker, j );
   }
 
-  return freed;
+  return fd_quic_conn_free_pkt_meta( conn, enc_level );
 }
 
 static void
@@ -1488,6 +1525,13 @@ fd_quic_handle_v1_initial( fd_quic_t *               quic,
     return FD_QUIC_PARSE_FAIL;
   }
 
+  /* count received token len */
+  int   const token_len_match = initial->token_len == sizeof(fd_quic_retry_token_t);
+  ulong const token_len_idx   = fd_ulong_if( !!initial->token_len,
+                                             fd_ulong_if( token_len_match, 1, 2 ),
+                                             0 );
+  metrics->initial_token_len_cnt[ token_len_idx ]++;
+
   /* Check it is valid for a token to be present in an initial packet in the current context.
 
      quic->config.role == FD_QUIC_ROLE_CLIENT
@@ -1530,7 +1574,7 @@ fd_quic_handle_v1_initial( fd_quic_t *               quic,
     }
 
     /* Early check: Is conn free? */
-    if( FD_UNLIKELY( state->free_conn_list==UINT_MAX ) ) {
+    if( FD_UNLIKELY( state->free_conn_list==UINT_MAX && state->svc_queue[FD_QUIC_SVC_TIMEOUT].head==UINT_MAX ) ) {
       FD_DEBUG( FD_LOG_DEBUG(( "ignoring conn request: no free conn slots" )) );
       metrics->conn_err_no_slots_cnt++;
       return FD_QUIC_PARSE_FAIL; /* FIXME better error code? */
@@ -1549,7 +1593,8 @@ fd_quic_handle_v1_initial( fd_quic_t *               quic,
     } else { /* retry configured */
 
       /* Need to send retry? Do so before more work */
-      if( initial->token_len == 0 ) {
+      if( initial->token_len != sizeof(fd_quic_retry_token_t) ) {
+
         ulong new_conn_id_u64 = fd_rng_ulong( state->_rng );
         if( FD_UNLIKELY( fd_quic_send_retry(
               quic, pkt,
@@ -1557,7 +1602,6 @@ fd_quic_handle_v1_initial( fd_quic_t *               quic,
           return FD_QUIC_FAILED;
         }
         return (initial->pkt_num_pnoff + initial->len);
-
       } else {
         /* This Initial packet is in response to our Retry.
            Validate the relevant fields of this post-retry INITIAL packet,
@@ -2252,6 +2296,11 @@ fd_quic_handle_v1_one_rtt( fd_quic_t *      quic,
   /* update expected packet number */
   conn->exp_pkt_number[2] = fd_ulong_max( conn->exp_pkt_number[2], pkt_number+1UL );
 
+  /* Revive conn if it was timed out */
+  if( FD_UNLIKELY( conn->state == FD_QUIC_CONN_STATE_TIMED_OUT ) ) {
+    fd_quic_set_conn_state( conn, FD_QUIC_CONN_STATE_ACTIVE );
+  }
+
   return tot_sz;
 }
 
@@ -2355,6 +2404,7 @@ fd_quic_process_quic_packet_v1( fd_quic_t *     quic,
     /* this is an error because it causes infinite looping */
     return FD_QUIC_PARSE_FAIL;
   }
+
   cur_ptr += rc;
 
   /* if we get here we parsed all the frames, so ack the packet */
@@ -2811,7 +2861,6 @@ fd_quic_tls_cb_peer_params( void *        context,
   int rc = fd_quic_decode_transport_params( peer_tp, peer_tp_enc, peer_tp_enc_sz );
   if( FD_UNLIKELY( rc != 0 ) ) {
     FD_DEBUG( FD_LOG_NOTICE(( "fd_quic_decode_transport_params failed" )); )
-
     /* failed to parse transport params */
     fd_quic_conn_error( conn, FD_QUIC_CONN_REASON_TRANSPORT_PARAMETER_ERROR, __LINE__ );
     return;
@@ -2835,6 +2884,7 @@ fd_quic_tls_cb_handshake_complete( fd_quic_tls_hs_t * hs,
       return;
 
     case FD_QUIC_CONN_STATE_HANDSHAKE:
+    case FD_QUIC_CONN_STATE_TIMED_OUT:
       if( FD_UNLIKELY( !conn->transport_params_set ) ) { /* unreachable */
         FD_LOG_WARNING(( "Handshake marked as completed but transport params are not set. This is a bug!" ));
         fd_quic_conn_error( conn, FD_QUIC_CONN_REASON_INTERNAL_ERROR, __LINE__ );
@@ -2930,15 +2980,38 @@ fd_quic_handle_crypto_frame( fd_quic_frame_ctx_t *    context,
   return rcv_sz;
 }
 
+/* Free resources associated with connection, for use when timed out
+   Frees all resources other than fd_quic_conn_t and fd_quic_tls_hs_t
+   Returns 0 if successful, 1 if some error (null conn, double free, etc.) */
+static int
+fd_quic_conn_free_resources( fd_quic_t * quic, fd_quic_conn_t * conn );
+
+/* Returns new conn state */
+static uint
+fd_quic_timeout_conn( fd_quic_t * quic, fd_quic_conn_t * conn ) {
+  quic->metrics.conn_timeout_cnt++;
+  if( quic->config.keep_timed_out ) {
+    fd_quic_state_t * state = fd_quic_get_state( quic );
+    fd_quic_conn_free_resources( quic, conn );
+    fd_quic_set_conn_state( conn, FD_QUIC_CONN_STATE_TIMED_OUT );
+    fd_quic_svc_schedule( state, conn, FD_QUIC_SVC_TIMEOUT );
+    return FD_QUIC_CONN_STATE_TIMED_OUT;
+  } else {
+    fd_quic_set_conn_state( conn, FD_QUIC_CONN_STATE_DEAD );
+    return FD_QUIC_CONN_STATE_DEAD;
+  }
+}
+
 static int
 fd_quic_svc_poll( fd_quic_t *      quic,
                   fd_quic_conn_t * conn,
                   ulong            now ) {
   fd_quic_state_t * state = fd_quic_get_state( quic );
-  if( FD_UNLIKELY( conn->state == FD_QUIC_CONN_STATE_INVALID ) ) {
+  if( FD_UNLIKELY( conn->state == FD_QUIC_CONN_STATE_INVALID ||
+                   conn->state == FD_QUIC_CONN_STATE_TIMED_OUT ) ) {
     /* connection shouldn't have been scheduled,
        and is now removed, so just continue */
-    FD_LOG_ERR(( "Invalid conn in schedule (svc_type=%u)", conn->svc_type ));
+    FD_LOG_CRIT(( "Bad conn in schedule (svc_type=%u), state=%s", conn->svc_type, conn->state==FD_QUIC_CONN_STATE_INVALID ? "INVALID" : "TIMED_OUT" ));
     return 1;
   }
 
@@ -2957,8 +3030,9 @@ fd_quic_svc_poll( fd_quic_t *      quic,
             conn->server?"SERVER":"CLIENT",
             (void *)conn, conn->conn_idx, (double)fd_quic_ticks_to_us(conn->idle_timeout_ticks) / 1e3 )); )
 
-        fd_quic_set_conn_state( conn, FD_QUIC_CONN_STATE_DEAD );
-        quic->metrics.conn_timeout_cnt++;
+        /* Handle timeout based on config. If left as TIMED_OUT rather than DEAD,
+           don't bother servicing further */
+        if( fd_quic_timeout_conn( quic, conn )==FD_QUIC_CONN_STATE_TIMED_OUT ) return 1;
       }
     } else if( quic->config.keep_alive & !!(conn->let_die_ticks > now) ) {
       /* send PING */
@@ -2987,12 +3061,26 @@ fd_quic_svc_poll( fd_quic_t *      quic,
     fd_quic_cb_conn_final( quic, conn ); /* inform user before freeing */
     fd_quic_conn_free( quic, conn );
     break;
+  case FD_QUIC_CONN_STATE_TIMED_OUT:
+    /* already in timeout queue, don't reschedule */
+    break;
   default:
     fd_quic_svc_schedule( state, conn, FD_QUIC_SVC_WAIT );
     break;
   }
 
   return 1;
+}
+
+/* Pops head of queue. Assumes queue is non-empty. */
+static void
+fd_quic_svc_pop_head( fd_quic_state_t     * state,
+                      fd_quic_svc_queue_t * queue,
+                      fd_quic_conn_t      * head ) {
+  uint             prev_idx = head->svc_prev;
+  fd_quic_conn_t * prev_ele = fd_quic_conn_at_idx( state, prev_idx );
+  *fd_ptr_if( prev_idx!=UINT_MAX, &prev_ele->svc_next, &queue->tail ) = UINT_MAX;
+  queue->head = prev_idx; /* update head of queue */
 }
 
 static int
@@ -3007,11 +3095,8 @@ fd_quic_svc_poll_head( fd_quic_t * quic,
   fd_quic_conn_t * conn = fd_quic_conn_at_idx( state, queue->head );
   if( conn->svc_time > now ) return 0;
 
-  /* Remove head of queue */
-  uint             prev_idx = conn->svc_prev;
-  fd_quic_conn_t * prev_ele = fd_quic_conn_at_idx( state, prev_idx );
-  *fd_ptr_if( prev_idx!=UINT_MAX, &prev_ele->svc_next, &queue->tail ) = UINT_MAX;
-  queue->head = prev_idx;
+  /* pop head */
+  fd_quic_svc_pop_head( state, queue, conn );
 
   return fd_quic_svc_poll( quic, conn, now );
 }
@@ -3927,7 +4012,7 @@ fd_quic_conn_tx( fd_quic_t      * quic,
       FD_LOG_WARNING(( "fd_quic_crypto_encrypt failed" ));
 
       /* this situation is unlikely to improve, so kill the connection */
-      conn->state = FD_QUIC_CONN_STATE_DEAD;
+      fd_quic_set_conn_state( conn, FD_QUIC_CONN_STATE_DEAD );
       fd_quic_svc_schedule( state, conn, FD_QUIC_SVC_INSTANT );
       quic->metrics.conn_aborted_cnt++;
       break;
@@ -4075,28 +4160,31 @@ fd_quic_conn_service( fd_quic_t * quic, fd_quic_conn_t * conn, ulong now ) {
 }
 
 void
-fd_quic_conn_free( fd_quic_t *      quic,
-                   fd_quic_conn_t * conn ) {
+fd_quic_free_timed_out( fd_quic_t * quic ) {
+  fd_quic_state_t     * state = fd_quic_get_state( quic );
+  fd_quic_svc_queue_t * queue = &state->svc_queue[ FD_QUIC_SVC_TIMEOUT ];
+  if( queue->head==UINT_MAX ) return;
+
+  fd_quic_conn_t * conn = fd_quic_conn_at_idx( state, queue->head );
+  fd_quic_svc_pop_head( state, queue, conn );
+
+  fd_quic_conn_free( quic, conn );
+}
+
+static int
+fd_quic_conn_free_resources( fd_quic_t      * quic,
+                             fd_quic_conn_t * conn ) {
   if( FD_UNLIKELY( !conn ) ) {
     FD_LOG_WARNING(( "NULL conn" ));
-    return;
+    return 1;
   }
   if( FD_UNLIKELY( conn->state == FD_QUIC_CONN_STATE_INVALID ) ) {
     FD_LOG_CRIT(( "double free detected" ));
-    return;
+    return 1;
   }
 
-  FD_COMPILER_MFENCE();
-  fd_quic_set_conn_state( conn, FD_QUIC_CONN_STATE_INVALID );
-  FD_COMPILER_MFENCE();
-
-  fd_quic_state_t * state = fd_quic_get_state( quic );
-
-  /* no need to remove this connection from the events queue
-     free is called from two places:
-       fini    - service will never be called again. All events are destroyed
-       service - removes event before calling free. Event only allowed to be
-       enqueued once */
+  /* free all pkt meta */
+  fd_quic_conn_free_pkt_meta( conn, fd_quic_enc_level_appdata_id );
 
   /* remove all stream ids from map, and free stream */
 
@@ -4144,6 +4232,21 @@ fd_quic_conn_free( fd_quic_t *      quic,
     }
   }
 
+  return 0;
+}
+
+void
+fd_quic_conn_free( fd_quic_t *      quic,
+                   fd_quic_conn_t * conn ) {
+
+  if( FD_UNLIKELY( fd_quic_conn_free_resources( quic, conn ) ) ) {
+    return;
+  }
+
+  fd_quic_set_conn_state( conn, FD_QUIC_CONN_STATE_INVALID );
+
+  fd_quic_state_t * state = fd_quic_get_state( quic );
+
   if( conn->tls_hs ) {
     /* free tls-hs */
     fd_quic_tls_hs_delete( conn->tls_hs );
@@ -4164,9 +4267,8 @@ fd_quic_conn_free( fd_quic_t *      quic,
   conn->svc_prev        = UINT_MAX;
   conn->svc_next        = state->free_conn_list;
   state->free_conn_list = conn->conn_idx;
-  fd_quic_set_conn_state( conn, FD_QUIC_CONN_STATE_INVALID );
 
-  quic->metrics.conn_active_cnt--;
+  quic->metrics.conn_alloc_cnt--;
 
   /* clear keys */
   memset( &conn->secrets, 0, sizeof(fd_quic_crypto_secrets_t) );
@@ -4180,7 +4282,6 @@ fd_quic_connect( fd_quic_t *  quic,
                  ushort       dst_udp_port,
                  uint         src_ip_addr,
                  ushort       src_udp_port ) {
-
   fd_quic_state_t * state = fd_quic_get_state( quic );
   state->now              = fd_quic_now( quic );
 
@@ -4190,7 +4291,6 @@ fd_quic_connect( fd_quic_t *  quic,
       return NULL;
     }
   }
-
 
   fd_rng_t * rng = state->_rng;
 
@@ -4287,9 +4387,15 @@ fd_quic_conn_create( fd_quic_t *               quic,
   /* fetch top of connection free list */
   uint conn_idx = state->free_conn_list;
   if( FD_UNLIKELY( conn_idx==UINT_MAX ) ) {
-    FD_DEBUG( FD_LOG_DEBUG(( "fd_quic_conn_create failed: no free conn slots" )) );
-    quic->metrics.conn_err_no_slots_cnt++;
-    return NULL;
+    /* No free connections, try to get one from timeout queue */
+    fd_quic_free_timed_out( quic );
+    conn_idx = state->free_conn_list;
+    if( FD_UNLIKELY( conn_idx==UINT_MAX ) ) {
+      /* still no conns? */
+      FD_DEBUG( FD_LOG_DEBUG(( "fd_quic_conn_create failed: no free conn slots" )) );
+      quic->metrics.conn_err_no_slots_cnt++;
+      return NULL;
+    }
   }
   if( FD_UNLIKELY( conn_idx >= quic->limits.conn_cnt ) ) {
     FD_LOG_ERR(( "Conn free list corruption detected" ));
@@ -4325,27 +4431,29 @@ fd_quic_conn_create( fd_quic_t *               quic,
   conn->svc_next        = UINT_MAX;
 
   /* initialize connection members */
-  conn->quic                = quic;
+  fd_quic_conn_clear( conn );
+
   conn->server              = !!server;
-  conn->established         = 0;
-  conn->called_conn_new     = 0;
   conn->svc_type            = UINT_MAX;
+  conn->svc_prev            = UINT_MAX;
+  conn->svc_next            = UINT_MAX;
   conn->svc_time            = LONG_MAX;
   conn->our_conn_id         = our_conn_id;
   conn->host                = (fd_quic_net_endpoint_t){
     .ip_addr  = self_ip_addr, /* may be 0, if outgoing */
     .udp_port = self_udp_port,
   };
-  memset( &conn->peer[0], 0, sizeof( conn->peer ) );
   conn->conn_gen++;
-  conn->token_len           = 0;
 
-  /* start with smallest value we allow, then allow peer to increase */
-  conn->tx_max_datagram_sz  = FD_QUIC_INITIAL_PAYLOAD_SZ_MAX;
-  conn->handshake_complete  = 0;
-  conn->handshake_done_send = 0;
-  conn->handshake_done_ackd = 0;
-  conn->tls_hs              = NULL; /* created later */
+
+  /* pkt_meta */
+  fd_quic_pkt_meta_tracker_init( &conn->pkt_meta_tracker,
+                                 quic->limits.inflight_frame_cnt,
+                                 state->pkt_meta_pool );
+
+  /* Initialize streams */
+  FD_QUIC_STREAM_LIST_SENTINEL( conn->send_streams );
+  FD_QUIC_STREAM_LIST_SENTINEL( conn->used_streams );
 
   /* initialize stream_id members */
   fd_quic_conn_stream_rx_t * srx = conn->srx;
@@ -4355,10 +4463,7 @@ fd_quic_conn_create( fd_quic_t *               quic,
   conn->tx_next_stream_id = server ? FD_QUIC_STREAM_TYPE_UNI_SERVER : FD_QUIC_STREAM_TYPE_UNI_CLIENT;
   conn->tx_sup_stream_id  = server ? FD_QUIC_STREAM_TYPE_UNI_SERVER : FD_QUIC_STREAM_TYPE_UNI_CLIENT;
 
-  srx->rx_max_streams_unidir_ackd = 0;
   srx->rx_max_data       = our_tp->initial_max_data;
-  srx->rx_tot_data       = 0;
-  srx->rx_streams_active = 0L;
 
   if( state->transport_params.initial_max_streams_uni_present ) {
     srx->rx_sup_stream_id = (state->transport_params.initial_max_streams_uni<<2) + FD_QUIC_STREAM_TYPE_UNI_CLIENT;
@@ -4372,32 +4477,15 @@ fd_quic_conn_create( fd_quic_t *               quic,
 
   conn->keys_avail = fd_uint_set_bit( 0U, fd_quic_enc_level_initial_id );
 
-  /* rfc9000: s12.3:
+  /* Packet numbers left as 0
+     rfc9000: s12.3:
      Packet numbers in each packet space start at 0.
      Subsequent packets sent in the same packet number space
        MUST increase the packet number by at least 1
      rfc9002: s3
      It is permitted for some packet numbers to never be used, leaving intentional gaps. */
-  memset( conn->exp_pkt_number, 0, sizeof( conn->exp_pkt_number ) );
-  memset( conn->last_pkt_number, 0, sizeof( conn->last_pkt_number ) );
-  memset( conn->pkt_number, 0, sizeof( conn->pkt_number ) );
-
-  memset( conn->hs_sent_bytes, 0, sizeof( conn->hs_sent_bytes ) );
-  memset( conn->hs_ackd_bytes, 0, sizeof( conn->hs_ackd_bytes ) );
-
-  memset( &conn->secrets, 0, sizeof( conn->secrets ) );
-  memset( &conn->keys, 0, sizeof( conn->keys ) );
-  memset( &conn->new_keys, 0, sizeof( conn->new_keys ) );
-  /* suites initialized above */
-
-  conn->key_phase            = 0;
-  conn->key_update           = 0;
 
   fd_quic_set_conn_state( conn, FD_QUIC_CONN_STATE_HANDSHAKE );
-  conn->reason               = 0;
-  conn->app_reason           = 0;
-  conn->flags                = 0;
-  conn->upd_pkt_number       = 0;
 
   /* start with minimum supported max datagram */
   /* peers may allow more */
@@ -4412,13 +4500,6 @@ fd_quic_conn_create( fd_quic_t *               quic,
   conn->peer[0].udp_port = peer_udp_port;
 
   fd_quic_ack_gen_init( conn->ack_gen );
-  conn->unacked_sz = 0UL;
-
-  /* flow control params */
-  conn->tx_max_data = 0;
-
-  /* no stream bytes sent or received yet */
-  conn->tx_tot_data = 0;
 
   /* initial rtt */
   /* overridden when acks start returning */
@@ -4436,16 +4517,13 @@ fd_quic_conn_create( fd_quic_t *               quic,
   rtt->var_rtt                   = FD_QUIC_INITIAL_RTT_US * (float)quic->config.tick_per_us * 0.5f;
   conn->rtt_period_ticks         = FD_QUIC_RTT_PERIOD_US  * (float)quic->config.tick_per_us;
 
-  /* highest peer encryption level */
-  conn->peer_enc_level = 0;
-
   /* idle timeout */
   conn->idle_timeout_ticks  = config->idle_timeout;
   conn->last_activity       = state->now;
   conn->let_die_ticks       = ULONG_MAX;
 
   /* update metrics */
-  quic->metrics.conn_active_cnt++;
+  quic->metrics.conn_alloc_cnt++;
   quic->metrics.conn_created_cnt++;
 
   /* immediately schedule it */

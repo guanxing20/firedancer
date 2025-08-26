@@ -13,8 +13,9 @@
 #include <unistd.h> /* dup3, close */
 #include <netinet/in.h> /* sockaddr_in */
 #include <sys/socket.h> /* socket */
-#include "generated/sock_seccomp.h"
 #include "../../metrics/fd_metrics.h"
+
+#include "generated/fd_sock_tile_seccomp.h"
 
 /* recv/sendmmsg packet count in batch and tango burst depth
    FIXME make configurable in the future?
@@ -40,8 +41,9 @@ populate_allowed_seccomp( fd_topo_t const *      topo,
                           struct sock_filter *   out ) {
   FD_SCRATCH_ALLOC_INIT( l, fd_topo_obj_laddr( topo, tile->tile_obj_id ) );
   fd_sock_tile_t * ctx = FD_SCRATCH_ALLOC_APPEND( l, alignof(fd_sock_tile_t), sizeof(fd_sock_tile_t) );
-  populate_sock_filter_policy_sock( out_cnt, out, (uint)fd_log_private_logfile_fd(), (uint)ctx->tx_sock, RX_SOCK_FD_MIN, RX_SOCK_FD_MIN+(uint)ctx->sock_cnt );
-  return sock_filter_policy_sock_instr_cnt;
+
+  populate_sock_filter_policy_fd_sock_tile( out_cnt, out, (uint)fd_log_private_logfile_fd(), (uint)ctx->tx_sock, RX_SOCK_FD_MIN, RX_SOCK_FD_MIN+(uint)ctx->sock_cnt );
+  return sock_filter_policy_fd_sock_tile_instr_cnt;
 }
 
 static ulong
@@ -207,18 +209,21 @@ privileged_init( fd_topo_t *      topo,
     DST_PROTO_SHRED,    /* shred_listen_port (turbine) */
     DST_PROTO_GOSSIP,   /* gossip_listen_port */
     DST_PROTO_REPAIR,   /* shred_listen_port (repair) */
-    DST_PROTO_REPAIR    /* repair_serve_listen_port */
+    DST_PROTO_REPAIR,   /* repair_serve_listen_port */
+    DST_PROTO_SEND      /* send_src_port */
   };
-  for( uint candidate_idx=0U; candidate_idx<6; candidate_idx++ ) {
+  for( uint candidate_idx=0U; candidate_idx<7; candidate_idx++ ) {
     if( !udp_port_candidates[ candidate_idx ] ) continue;
     uint sock_idx = ctx->sock_cnt;
     if( candidate_idx>FD_SOCK_TILE_MAX_SOCKETS ) FD_LOG_ERR(( "too many sockets" ));
     ushort port = (ushort)udp_port_candidates[ candidate_idx ];
 
     /* Validate value of REPAIR_SHRED_SOCKET_ID */
-    if( udp_port_candidates[sock_idx]==tile->sock.net.repair_intake_listen_port )
+    if( tile->sock.net.repair_intake_listen_port &&
+       udp_port_candidates[sock_idx]==tile->sock.net.repair_intake_listen_port )
       FD_TEST( sock_idx==REPAIR_SHRED_SOCKET_ID );
-    if( udp_port_candidates[sock_idx]==tile->sock.net.repair_serve_listen_port )
+    if( tile->sock.net.repair_serve_listen_port &&
+       udp_port_candidates[sock_idx]==tile->sock.net.repair_serve_listen_port )
       FD_TEST( sock_idx==REPAIR_SHRED_SOCKET_ID+1 );
 
     char const * target_link = udp_port_links[ candidate_idx ];
@@ -406,7 +411,7 @@ poll_rx_socket( fd_sock_tile_t *    ctx,
 
     ctx->metrics.rx_pkt_cnt++;
     ulong chunk = fd_laddr_to_chunk( base, eth_hdr );
-    ulong sig   = fd_disco_netmux_sig( sa->sin_addr.s_addr, fd_ushort_bswap( sa->sin_port ), 0U, proto, hdr_sz );
+    ulong sig   = fd_disco_netmux_sig( sa->sin_addr.s_addr, fd_ushort_bswap( sa->sin_port ), sa->sin_addr.s_addr, proto, hdr_sz );
     ulong tspub = fd_frag_meta_ts_comp( ts );
 
     /* default for repair intake is to send to [shreds] to shred tile.
@@ -438,8 +443,8 @@ poll_rx( fd_sock_tile_t *    ctx,
     FD_LOG_ERR(( "Batch is not clean" ));
   }
   ctx->tx_idle_cnt = 0; /* restart TX polling */
-  if( FD_UNLIKELY( poll( ctx->pollfd, ctx->sock_cnt, 0 )<0 ) ) {
-    FD_LOG_ERR(( "poll failed (%i-%s)", errno, fd_io_strerror( errno ) ));
+  if( FD_UNLIKELY( fd_syscall_poll( ctx->pollfd, ctx->sock_cnt, 0 )<0 ) ) {
+    FD_LOG_ERR(( "fd_syscall_poll failed (%i-%s)", errno, fd_io_strerror( errno ) ));
   }
   for( uint j=0UL; j<ctx->sock_cnt; j++ ) {
     if( ctx->pollfd[ j ].revents & (POLLIN|POLLERR) ) {

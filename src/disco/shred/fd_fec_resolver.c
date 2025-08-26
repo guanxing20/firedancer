@@ -18,6 +18,7 @@ struct __attribute__((aligned(32UL))) set_ctx {
   wrapped_sig_t         sig;
   fd_fec_set_t *        set;
   fd_bmtree_commit_t  * tree;
+  fd_bmtree_node_t      root;
   set_ctx_t *           prev;
   set_ctx_t *           next;
   ulong                 total_rx_shred_cnt;
@@ -190,7 +191,6 @@ fd_fec_resolver_new( void                    * shmem,
                      ulong                     complete_depth,
                      ulong                     done_depth,
                      fd_fec_set_t            * sets,
-                     ushort                    expected_shred_version,
                      ulong                     max_shred_idx ) {
   if( FD_UNLIKELY( (depth==0UL) | (partial_depth==0UL) | (complete_depth==0UL) | (done_depth==0UL) ) ) return NULL;
   if( FD_UNLIKELY( (depth>=(1UL<<62)-1UL) | (done_depth>=(1UL<<62)-1UL ) ) ) return NULL;
@@ -231,8 +231,6 @@ fd_fec_resolver_new( void                    * shmem,
   for( ulong i=0UL; i<depth; i++ ) { bmtrlist_push_tail( bmtree_list, (uchar *)bmfootprint + i*footprint_per_bmtree ); }
   bmtrlist_leave( bmtree_list );
 
-  if( FD_UNLIKELY( expected_shred_version==(ushort)0 ) ) { FD_LOG_WARNING(( "expected shred version cannot be 0" )); return NULL; }
-
   resolver->curr_ll_sentinel->prev = resolver->curr_ll_sentinel;
   resolver->curr_ll_sentinel->next = resolver->curr_ll_sentinel;
   resolver->done_ll_sentinel->prev = resolver->done_ll_sentinel;
@@ -242,7 +240,7 @@ fd_fec_resolver_new( void                    * shmem,
   resolver->partial_depth          = partial_depth;
   resolver->complete_depth         = complete_depth;
   resolver->done_depth             = done_depth;
-  resolver->expected_shred_version = expected_shred_version;
+  resolver->expected_shred_version = 0;
   resolver->signer                 = signer;
   resolver->sign_ctx               = sign_ctx;
   resolver->max_shred_idx          = max_shred_idx;
@@ -277,6 +275,12 @@ fd_fec_resolver_join( void * shmem ) {
   if( FD_UNLIKELY( !fd_sha512_join( resolver->sha512 ) ) ) return NULL;
 
   return resolver;
+}
+
+void
+fd_fec_resolver_set_shred_version( fd_fec_resolver_t * resolver,
+                                   ushort              expected_shred_version ) {
+  resolver->expected_shred_version = expected_shred_version;
 }
 
 /* Two helper functions for working with the linked lists that are
@@ -405,8 +409,8 @@ int fd_fec_resolver_add_shred( fd_fec_resolver_t    * resolver,
   if( FD_UNLIKELY( tree_depth>FD_SHRED_MERKLE_LAYER_CNT-1UL             ) ) return FD_FEC_RESOLVER_SHRED_REJECTED;
   if( FD_UNLIKELY( fd_bmtree_depth( shred_idx+1UL ) > tree_depth+1UL ) ) return FD_FEC_RESOLVER_SHRED_REJECTED;
 
-  if( FD_UNLIKELY( !ctx ) ) {
-    /* This is the first shred in the FEC set */
+  if( FD_UNLIKELY( !ctx ) ) { /* This is the first shred in the FEC set */
+
     if( FD_UNLIKELY( freelist_cnt( free_list )<=partial_depth ) ) {
       /* Packet loss is really high and we have a lot of in-progress FEC
          sets that we haven't been able to finish.  Take the resources
@@ -455,14 +459,12 @@ int fd_fec_resolver_add_shred( fd_fec_resolver_t    * resolver,
       return FD_FEC_RESOLVER_SHRED_REJECTED;
     }
 
-    /* Copy the merkle root into the output arg. */
-    if( FD_LIKELY( out_merkle_root ) ) memcpy( out_merkle_root, _root, sizeof(fd_bmtree_node_t) );
-
     /* This seems like a legitimate FEC set, so we can reserve some
        resources for it. */
     ctx = ctx_ll_insert( curr_ll_sentinel, ctx_map_insert( curr_map, *w_sig ) );
     ctx->set  = set_to_use;
     ctx->tree = tree;
+    ctx->root = *_root;
     ctx->total_rx_shred_cnt = 0UL;
     ctx->data_variant   = fd_uchar_if(  is_data_shred, variant, fd_shred_variant( fd_shred_swap_type( shred_type ), (uchar)tree_depth ) );
     ctx->parity_variant = fd_uchar_if( !is_data_shred, variant, fd_shred_variant( fd_shred_swap_type( shred_type ), (uchar)tree_depth ) );
@@ -478,6 +480,9 @@ int fd_fec_resolver_add_shred( fd_fec_resolver_t    * resolver,
     ctx->set->parity_shred_cnt = SHRED_CNT_NOT_SET;
     d_rcvd_join( d_rcvd_new( d_rcvd_delete( d_rcvd_leave( ctx->set->data_shred_rcvd   ) ) ) );
     p_rcvd_join( p_rcvd_new( p_rcvd_delete( p_rcvd_leave( ctx->set->parity_shred_rcvd ) ) ) );
+
+    /* Copy the merkle root into the output arg. */
+    if( FD_LIKELY( out_merkle_root ) ) memcpy( out_merkle_root, ctx->root.hash, sizeof(fd_bmtree_node_t) );
 
   } else {
     /* This is not the first shred in the set */
@@ -495,7 +500,7 @@ int fd_fec_resolver_add_shred( fd_fec_resolver_t    * resolver,
     }
 
     fd_shred_merkle_t const * proof = fd_shred_merkle_nodes( shred );
-    int rv = fd_bmtree_commitp_insert_with_proof( ctx->tree, shred_idx, leaf, (uchar const *)proof, tree_depth, NULL );
+    int rv = fd_bmtree_commitp_insert_with_proof( ctx->tree, shred_idx, leaf, (uchar const *)proof, tree_depth, out_merkle_root );
     if( !rv ) return FD_FEC_RESOLVER_SHRED_REJECTED;
   }
 
@@ -729,9 +734,10 @@ fd_fec_resolver_shred_query( fd_fec_resolver_t      * resolver,
    requesting coding shreds is made available. */
 
 int
-fd_fec_resolver_force_complete( fd_fec_resolver_t *   resolver,
-                                fd_shred_t const *    last_shred,
-                                fd_fec_set_t const ** out_fec_set ) {
+fd_fec_resolver_force_complete( fd_fec_resolver_t  *  resolver,
+                                fd_shred_t const   *  last_shred,
+                                fd_fec_set_t const ** out_fec_set,
+                                fd_bmtree_node_t   *  out_merkle_root ) {
 
   /* Error if last_shred is obviously invalid... don't even
      try to process the associated FEC set. */
@@ -799,6 +805,15 @@ fd_fec_resolver_force_complete( fd_fec_resolver_t *   resolver,
                            (uchar *)base_data_shred+fd_shred_chain_off( base_data_shred->variant ), FD_SHRED_MERKLE_ROOT_SZ );
   }
 
+  /* Populate correct shred cnts for post-completion processing. These
+     are normally populated by the parity shred header, but in the case
+     of force_complete, a parity shred was never received. */
+
+  ctx->set->data_shred_cnt   = idx_in_set + 1UL;
+  ctx->set->parity_shred_cnt = 0UL;
+
+  /* Reject FEC set if it didn't validate and return mem to the pools */
+
   if( FD_UNLIKELY( reject ) ) {
     freelist_push_tail( resolver->free_list,        ctx->set  );
     bmtrlist_push_tail( resolver->bmtree_free_list, ctx->tree );
@@ -806,11 +821,9 @@ fd_fec_resolver_force_complete( fd_fec_resolver_t *   resolver,
     return FD_FEC_RESOLVER_SHRED_REJECTED;
   }
 
-  /* Populate correct shred cnts for post-completion processing, like
-     forwarding to blockstore. */
+  /* Copy out the merkle root. */
 
-  ctx->set->data_shred_cnt   = idx_in_set + 1UL;
-  ctx->set->parity_shred_cnt = 0UL;
+  if( FD_LIKELY( out_merkle_root) ) memcpy( out_merkle_root, ctx->root.hash, sizeof(fd_bmtree_node_t) );
 
   /* Don't need to populate merkle proofs or retransmitter signatures
      because it is by definition the full set of rcvd data shreds. */

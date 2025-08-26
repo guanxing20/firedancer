@@ -46,7 +46,7 @@ fd_quic_conn_footprint_ext( fd_quic_limits_t const * limits,
     }
     layout->stream_map_lg = (int)lg;
 
-    off                     = fd_ulong_align_up( off, fd_quic_stream_align() );
+    off                     = fd_ulong_align_up( off, fd_quic_stream_map_align() );
     layout->stream_map_off  = off;
     off                    += fd_quic_stream_map_footprint( (int)lg );
   } else {
@@ -103,8 +103,13 @@ fd_quic_conn_new( void *                   mem,
   fd_quic_conn_t * conn = (fd_quic_conn_t *)mem;
   fd_memset( conn, 0, sizeof(fd_quic_conn_t) );
 
-  conn->quic  = quic;
-  fd_quic_set_conn_state( conn, FD_QUIC_CONN_STATE_INVALID );
+  conn->quic     = quic;
+  conn->state    = FD_QUIC_CONN_STATE_INVALID;
+  conn->svc_type = UINT_MAX;
+  conn->svc_prev = UINT_MAX;
+  conn->svc_next = UINT_MAX;
+
+  quic->metrics.conn_state_cnt[ FD_QUIC_CONN_STATE_INVALID ]++;
 
   /* Initialize streams */
 
@@ -122,8 +127,8 @@ fd_quic_conn_new( void *                   mem,
   /* Initialize packet meta tracker */
   fd_quic_state_t * state = fd_quic_get_state( quic );
   fd_quic_pkt_meta_tracker_init( &conn->pkt_meta_tracker,
-                                quic->limits.inflight_frame_cnt,
-                                state->pkt_meta_pool );
+                                 quic->limits.inflight_frame_cnt,
+                                 state->pkt_meta_pool );
 
 
   return conn;

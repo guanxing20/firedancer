@@ -489,7 +489,14 @@ fd_log_sleep( long dt ) {
   struct timespec rem[1];
   req->tv_sec  = (time_t)( ((ulong)ns_dt) / ((ulong)1e9) ); /* in [0,2^31-1] */
   req->tv_nsec = (long)  ( ((ulong)ns_dt) % ((ulong)1e9) ); /* in [0,1e9) */
-  if( FD_UNLIKELY( nanosleep( req, rem ) ) && FD_LIKELY( errno==EINTR ) ) dt += ((long)1e9)*((long)rem->tv_sec) + rem->tv_nsec;
+  int sleep_res;
+#if defined(__linux__)
+  /* Always use clock_nanosleep on Linux to be predictable */
+  sleep_res = clock_nanosleep( CLOCK_REALTIME, 0, req, rem );
+#else
+  sleep_res = nanosleep( req, rem );
+#endif
+  if( FD_UNLIKELY( sleep_res ) && FD_LIKELY( errno==EINTR ) ) dt += ((long)1e9)*((long)rem->tv_sec) + rem->tv_nsec;
   return dt;
 }
 
@@ -1001,6 +1008,13 @@ fd_log_private_sig_abort( int         sig,
                           void *      context ) {
   (void)info; (void)context;
 
+  /* Thread could have caught signal while holding a lock.
+     Hack around this re-entrancy problem by pointing the log lock to
+     a dummy buffer. */
+  int * old_lock = fd_log_private_shared_lock;
+  static FD_TL int lock = 0;
+  fd_log_private_shared_lock = &lock;
+
   /* Hopefully all out streams are idle now and we have flushed out
      all non-logging activity ... log a backtrace */
 
@@ -1035,6 +1049,7 @@ fd_log_private_sig_abort( int         sig,
 
   usleep( (useconds_t)1000000 ); /* Give some time to let streams drain */
 
+  fd_log_private_shared_lock = old_lock;
   raise( sig ); /* Continue with the original handler (probably the default and that will produce the core) */
 }
 

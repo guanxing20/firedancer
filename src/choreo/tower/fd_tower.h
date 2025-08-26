@@ -422,12 +422,7 @@
 #include "../fd_choreo_base.h"
 #include "../epoch/fd_epoch.h"
 #include "../ghost/fd_ghost.h"
-#include "../voter/fd_voter.h"
 #include "../../disco/pack/fd_microblock.h"
-#include "../../flamenco/runtime/fd_blockstore.h"
-#include "../../flamenco/runtime/fd_system_ids.h"
-#include "../../flamenco/txn/fd_txn_generate.h"
-#include "../../funk/fd_funk.h"
 
 /* FD_TOWER_USE_HANDHOLDING:  Define this to non-zero at compile time
    to turn on additional runtime checks and logging. */
@@ -522,7 +517,7 @@ void *
 fd_tower_delete( void * tower );
 
 /* fd_tower_lockout_check checks if we are locked out from voting for
-   `slot`.  Returns 1 if we can vote for `slot` without violating
+   the `slot`.  Returns 1 if we can vote for `slot` without violating
    lockout, 0 otherwise.  Assumes tower is non-empty.
 
    After voting for a slot n, we are locked out for 2^k slots, where k
@@ -587,7 +582,8 @@ fd_tower_delete( void * tower );
 int
 fd_tower_lockout_check( fd_tower_t const * tower,
                         fd_ghost_t const * ghost,
-                        ulong slot );
+                        ulong              slot,
+                        fd_hash_t const *  block_id );
 
 /* fd_tower_switch_check checks if we can switch to the fork of `slot`.
    Returns 1 if we can switch, 0 otherwise.  Assumes tower is non-empty.
@@ -621,7 +617,8 @@ int
 fd_tower_switch_check( fd_tower_t const * tower,
                        fd_epoch_t const * epoch,
                        fd_ghost_t const * ghost,
-                       ulong              slot );
+                       ulong              slot,
+                       fd_hash_t const *  block_id );
 
 /* fd_tower_threshold_check checks if we pass the threshold required to
    vote for `slot`.  This is only relevant after voting for (and
@@ -764,6 +761,12 @@ fd_tower_to_vote_txn( fd_tower_t const *    tower,
 
 int
 fd_tower_verify( fd_tower_t const * tower );
+
+/* fd_tower_on_duplicate checks if the tower is on the same fork with an
+   invalid ancestor. */
+
+int
+fd_tower_on_duplicate( fd_tower_t const * tower, fd_ghost_t const * ghost );
 
 /* fd_tower_print pretty-prints tower as a formatted table.
 

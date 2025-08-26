@@ -11,14 +11,13 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include "../../discof/rpcserver/fd_rpc_service.h"
+#include "../../funk/fd_funk.h"
 
 #define SHAM_LINK_CONTEXT fd_rpc_ctx_t
-#define SHAM_LINK_STATE   fd_replay_notif_msg_t
 #define SHAM_LINK_NAME    replay_sham_link
 #include "sham_link.h"
 
 #define SHAM_LINK_CONTEXT fd_rpc_ctx_t
-#define SHAM_LINK_STATE   fd_multi_epoch_leaders_t
 #define SHAM_LINK_NAME    stake_sham_link
 #include "sham_link.h"
 
@@ -42,7 +41,6 @@ init_args( int * argc, char *** argv, fd_rpcserver_args_t * args ) {
   if( FD_UNLIKELY( !funk ))
     FD_LOG_ERR(( "failed to join funk" ));
 
-  args->blockstore_fd = -1;
 
   const char * wksp_name = fd_env_strip_cmdline_cstr ( argc, argv, "--wksp-name-blockstore", NULL, "fd1_blockstore.wksp" );
   FD_LOG_NOTICE(( "attaching to workspace \"%s\"", wksp_name ));
@@ -53,15 +51,8 @@ init_args( int * argc, char *** argv, fd_rpcserver_args_t * args ) {
   if( fd_wksp_tag_query( wksp, &tag, 1, &info, 1 ) <= 0 ) {
     FD_LOG_ERR(( "workspace \"%s\" does not contain a blockstore", wksp_name ));
   }
-  void * shmem = fd_wksp_laddr_fast( wksp, info.gaddr_lo );
-  args->blockstore = fd_blockstore_join( &args->blockstore_ljoin, shmem );
-  if( args->blockstore == NULL ) {
-    FD_LOG_ERR(( "failed to join a blockstore" ));
-  }
-  FD_LOG_NOTICE(( "blockstore has slot root=%lu", args->blockstore->shmem->wmk ));
   fd_wksp_mprotect( wksp, 1 );
 
-  args->leaders = fd_multi_epoch_leaders_join( fd_multi_epoch_leaders_new( aligned_alloc( fd_multi_epoch_leaders_align(), fd_multi_epoch_leaders_footprint() ) ) );
   args->port    = (ushort)fd_env_strip_cmdline_ulong( argc, argv, "--port", NULL, 8899 );
 
   args->params.max_connection_cnt =    fd_env_strip_cmdline_ulong( argc, argv, "--max-connection-cnt",    NULL, 30 );
@@ -138,12 +129,6 @@ init_args_offline( int * argc, char *** argv, fd_rpcserver_args_t * args ) {
   if( fd_wksp_tag_query( wksp, &tag, 1, &info, 1 ) <= 0 ) {
     FD_LOG_ERR(( "workspace does not contain a blockstore" ));
   }
-  void * shmem = fd_wksp_laddr_fast( wksp, info.gaddr_lo );
-  args->blockstore = fd_blockstore_join( &args->blockstore_ljoin, shmem );
-  if( args->blockstore == NULL ) {
-    FD_LOG_ERR(( "failed to join a blockstore" ));
-  }
-  FD_LOG_NOTICE(( "blockstore has slot root=%lu", args->blockstore->shmem->wmk ));
   fd_wksp_mprotect( wksp, 1 );
 
   args->port = (ushort)fd_env_strip_cmdline_ulong( argc, argv, "--port", NULL, 8899 );
@@ -218,10 +203,9 @@ int main( int argc, char ** argv ) {
   replay_sham_link_start( rep_notify );
   stake_sham_link_start( stake_notify );
   while( !stopflag ) {
-    fd_replay_notif_msg_t msg;
-    replay_sham_link_poll( rep_notify, ctx, &msg );
+    replay_sham_link_poll( rep_notify, ctx );
 
-    stake_sham_link_poll( stake_notify, ctx, args.leaders );
+    stake_sham_link_poll( stake_notify, ctx );
 
     fd_rpc_ws_poll( ctx );
   }
@@ -231,21 +215,21 @@ int main( int argc, char ** argv ) {
 }
 
 static void
-replay_sham_link_during_frag(fd_rpc_ctx_t * ctx, fd_replay_notif_msg_t * state, void const * msg, int sz) {
-  fd_rpc_replay_during_frag( ctx, state, msg, sz );
+replay_sham_link_during_frag(fd_rpc_ctx_t * ctx, void const * msg, int sz) {
+  fd_rpc_replay_during_frag( ctx, msg, sz );
 }
 
 static void
-replay_sham_link_after_frag(fd_rpc_ctx_t * ctx, fd_replay_notif_msg_t * msg) {
-  fd_rpc_replay_after_frag( ctx, msg );
+replay_sham_link_after_frag(fd_rpc_ctx_t * ctx) {
+  fd_rpc_replay_after_frag( ctx );
 }
 
 static void
-stake_sham_link_during_frag(fd_rpc_ctx_t * ctx, fd_multi_epoch_leaders_t * state, void const * msg, int sz) {
-  fd_rpc_stake_during_frag( ctx, state, msg, sz );
+stake_sham_link_during_frag(fd_rpc_ctx_t * ctx, void const * msg, int sz) {
+  fd_rpc_stake_during_frag( ctx, msg, sz );
 }
 
 static void
-stake_sham_link_after_frag(fd_rpc_ctx_t * ctx, fd_multi_epoch_leaders_t * state) {
-  fd_rpc_stake_after_frag( ctx, state );
+stake_sham_link_after_frag(fd_rpc_ctx_t * ctx) {
+  fd_rpc_stake_after_frag( ctx );
 }

@@ -3,8 +3,8 @@
 
 #include "../../ballet/shred/fd_shred.h"
 #include "../../flamenco/leaders/fd_leaders.h"
+#include "../../flamenco/gossip/fd_gossip_types.h"
 #include "../fd_choreo_base.h"
-#include "../../flamenco/runtime/fd_blockstore.h"
 
 /* fd_eqvoc presents an API for detecting and sending / receiving proofs
    of equivocation.
@@ -91,6 +91,8 @@ typedef struct fd_eqvoc_fec fd_eqvoc_fec_t;
 #define FD_EQVOC_PROOF_CHUNK_CNT (( FD_EQVOC_PROOF_SZ / FD_EQVOC_PROOF_CHUNK_SZ ) + 1) /* 3 */
 #define FD_EQVOC_PROOF_SZ (2*FD_SHRED_MAX_SZ + 2*sizeof(ulong)) /* 2 shreds prefixed with sz, encoded in 3 chunks */
 
+FD_STATIC_ASSERT( FD_EQVOC_PROOF_CHUNK_SZ==FD_GOSSIP_DUPLICATE_SHRED_MAX_CHUNKS, "Update duplicate shred max chunks size" );
+
 /* The chunk_cnt is encoded in a UCHAR_MAX, so you can have at most
    UCHAR_MAX chunks */
 
@@ -121,7 +123,7 @@ struct fd_eqvoc_proof {
   fd_pubkey_t         producer;   /* producer of shreds' pubkey */
   void *              bmtree_mem; /* scratch space for reconstructing
                                      the merkle root */
-  ulong               wallclock;  /* `wallclock` */
+  long                wallclock;  /* `wallclock` (nanos) */
   ulong               chunk_cnt;  /* `num_chunks` */
   ulong               chunk_sz;   /* `chunk_len` */
 
@@ -328,7 +330,7 @@ fd_eqvoc_proof_t *
 fd_eqvoc_proof_insert( fd_eqvoc_t * eqvoc, ulong slot, fd_pubkey_t const * from );
 
 void
-fd_eqvoc_proof_init( fd_eqvoc_proof_t * proof, fd_pubkey_t const * producer, ulong wallclock, ulong chunk_cnt, ulong chunk_sz, void * bmtree_mem );
+fd_eqvoc_proof_init( fd_eqvoc_proof_t * proof, fd_pubkey_t const * producer, long wallclock, ulong chunk_cnt, ulong chunk_sz, void * bmtree_mem );
 
 /* fd_eqvoc_proof_chunk_insert inserts a proof chunk into the proof.
    Proofs are divided into chunks before they are transmitted via
@@ -447,7 +449,7 @@ fd_eqvoc_proof_shred2_const( fd_eqvoc_proof_t const * proof ) {
    hash chains from the last FEC set in parent slot's merkle hash. */
 
 int
-fd_eqvoc_slot_verify( fd_eqvoc_t const * eqvoc, fd_blockstore_t * blockstore, ulong slot );
+fd_eqvoc_slot_verify( fd_eqvoc_t const * eqvoc, ulong slot );
 
 /* fd_eqvoc_from_chunks reconstructs shred1_out and shred2_out from
    `chunks` which is an array of "duplicate shred" gossip msgs. Shred1

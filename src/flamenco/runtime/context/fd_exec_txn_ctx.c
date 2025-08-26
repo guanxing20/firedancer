@@ -176,10 +176,12 @@ void
 fd_exec_txn_ctx_setup_basic( fd_exec_txn_ctx_t * ctx ) {
   fd_compute_budget_details_new( &ctx->compute_budget_details );
 
-  ctx->custom_err                = UINT_MAX;
+  ctx->custom_err                = 0U;
   ctx->instr_stack_sz            = 0;
   ctx->accounts_cnt              = 0UL;
   ctx->executable_cnt            = 0UL;
+  ctx->programs_to_reverify_cnt  = 0UL;
+
   ctx->paid_fees                 = 0UL;
   ctx->loaded_accounts_data_size = 0UL;
   ctx->accounts_resize_delta     = 0UL;
@@ -190,7 +192,6 @@ fd_exec_txn_ctx_setup_basic( fd_exec_txn_ctx_t * ctx ) {
   ctx->return_data.len = 0;
 
   ctx->dirty_vote_acc  = 0;
-  ctx->dirty_stake_acc = 0;
   ctx->failed_instr    = NULL;
   ctx->instr_err_idx   = INT_MAX;
   ctx->capture_ctx     = NULL;
@@ -304,7 +305,7 @@ fd_txn_account_check_exists( fd_txn_account_t *        acc,
                              ushort                    idx ) {
   (void) ctx;
   (void) idx;
-  return fd_account_meta_exists( acc->vt->get_meta( acc ) );
+  return fd_account_meta_exists( fd_txn_account_get_meta( acc ) );
 }
 
 int
@@ -329,5 +330,5 @@ fd_txn_account_check_borrow_mut( fd_txn_account_t *        acc,
                                  ushort                    idx ) {
   (void) ctx;
   (void) idx;
-  return acc->vt->is_mutable( acc ) && acc->vt->try_borrow_mut( acc );
+  return fd_txn_account_is_mutable( acc ) && fd_txn_account_try_borrow_mut( acc );
 }

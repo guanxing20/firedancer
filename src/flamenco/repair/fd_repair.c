@@ -40,6 +40,12 @@ fd_repair_new ( void * shmem, ulong seed ) {
   glob->peer_idx   = 0;
   glob->actives_random_seed  = 0;
 
+  /* Initialize pending sign request pool and map */
+  shm = FD_SCRATCH_ALLOC_APPEND( l, fd_repair_pending_sign_req_pool_align(), fd_repair_pending_sign_req_pool_footprint( FD_REPAIR_PENDING_SIGN_REQ_MAX ) );
+  glob->pending_sign_req_pool = fd_repair_pending_sign_req_pool_join( fd_repair_pending_sign_req_pool_new( shm, FD_REPAIR_PENDING_SIGN_REQ_MAX ) );
+  shm = FD_SCRATCH_ALLOC_APPEND( l, fd_repair_pending_sign_req_map_align(), fd_repair_pending_sign_req_map_footprint( FD_REPAIR_PENDING_SIGN_REQ_MAX ) );
+  glob->pending_sign_req_map = fd_repair_pending_sign_req_map_join( fd_repair_pending_sign_req_map_new( shm, FD_REPAIR_PENDING_SIGN_REQ_MAX, seed ) );
+
   ulong scratch_top = FD_SCRATCH_ALLOC_FINI(l, 1UL);
   if ( scratch_top > (ulong)shmem + fd_repair_footprint() ) {
     FD_LOG_ERR(("Enough space not allocated for repair"));
@@ -60,11 +66,13 @@ fd_repair_delete ( void * shmap ) {
   fd_active_table_delete( fd_active_table_leave( glob->actives ) );
   fd_inflight_table_delete( fd_inflight_table_leave( glob->dupdetect ) );
   fd_pinged_table_delete( fd_pinged_table_leave( glob->pinged ) );
+  fd_repair_pending_sign_req_pool_delete( fd_repair_pending_sign_req_pool_leave( glob->pending_sign_req_pool ) );
+  fd_repair_pending_sign_req_map_delete( fd_repair_pending_sign_req_map_leave( glob->pending_sign_req_map ) );
   return glob;
 }
 
 /* Convert an address to a human readable string */
-const char * fd_repair_addr_str( char * dst, size_t dstlen, fd_repair_peer_addr_t const * src ) {
+const char * fd_repair_addr_str( char * dst, size_t dstlen, fd_ip4_port_t const * src ) {
   char tmp[INET_ADDRSTRLEN];
   snprintf(dst, dstlen, "%s:%u", inet_ntop(AF_INET, &src->addr, tmp, INET_ADDRSTRLEN), (uint)ntohs(src->port));
   return dst;
@@ -87,7 +95,7 @@ fd_repair_set_config( fd_repair_t * glob, const fd_repair_config_t * config ) {
 }
 
 int
-fd_repair_update_addr( fd_repair_t * glob, const fd_repair_peer_addr_t * intake_addr, const fd_repair_peer_addr_t * service_addr ) {
+fd_repair_update_addr( fd_repair_t * glob, const fd_ip4_port_t * intake_addr, const fd_ip4_port_t * service_addr ) {
   char tmp[100];
   FD_LOG_NOTICE(("updating address %s", fd_repair_addr_str(tmp, sizeof(tmp), intake_addr)));
 
@@ -98,7 +106,7 @@ fd_repair_update_addr( fd_repair_t * glob, const fd_repair_peer_addr_t * intake_
 
 /* Initiate connection to a peer */
 int
-fd_repair_add_active_peer( fd_repair_t * glob, fd_repair_peer_addr_t const * addr, fd_pubkey_t const * id ) {
+fd_repair_add_active_peer( fd_repair_t * glob, fd_ip4_port_t const * addr, fd_pubkey_t const * id ) {
   fd_active_elem_t * val = fd_active_table_query(glob->actives, id, NULL);
   if (val == NULL) {
     val = fd_active_table_insert(glob->actives, id);
@@ -242,7 +250,7 @@ fd_read_in_good_peer_cache_file( fd_repair_t * repair ) {
     }
 
     /* Create the peer address struct (byte-swap the port to network order). */
-    //fd_repair_peer_addr_t peer_addr;
+    //fd_ip4_port_t peer_addr;
     /* already in network byte order from inet_aton */
     //peer_addr.addr = ip_addr;
     /* Flip to big-endian for network order */
@@ -366,7 +374,7 @@ fd_repair_create_inflight_request( fd_repair_t * glob, int type, ulong slot, uin
     dupelem->last_send_time = 0L;
   }
 
-  if( FD_LIKELY( dupelem->last_send_time+(long)40e6  < now ) ) { /* 40ms */
+  if( FD_LIKELY( dupelem->last_send_time+(long)80e6  < now ) ) { /* 80ms */
     dupelem->last_send_time = now;
     dupelem->req_cnt        = FD_REPAIR_NUM_NEEDED_PEERS;
     return 1;
@@ -524,4 +532,85 @@ fd_repair_set_stake_weights_fini( fd_repair_t * repair ) {
 fd_repair_metrics_t *
 fd_repair_get_metrics( fd_repair_t * repair ) {
   return &repair->metrics;
+}
+
+/* Pending Sign Request API
+
+   These functions manage the pool and map of pending sign requests in
+   the repair module. Each request is identified by a unique nonce,
+   allowing for nonce to be used as a key in the map.
+
+  fd_repair_pending_sign_req_t * fd_repair_acquire_pending_request(...);
+    Acquires an empty pending sign request from the pool. Returns
+    pointer or NULL if pool is full. Caller is responsible for setting
+    all fields before adding to map.
+
+  int fd_repair_add_pending_to_map(...);
+    Adds a pending sign request to the map. Returns 0 on success, -1 on
+    failure. The pending request must be previously acquired from the
+    pool.
+
+  fd_repair_pending_sign_req_t * fd_repair_find_pending_request(...);
+    Finds a pending sign request by nonce. Returns pointer or NULL.
+
+  int fd_repair_remove_pending_request(...);
+    Removes a pending sign request by nonce. Returns 0 on success, -1
+    if not found.
+
+   All functions assume the repair context is valid and not used concurrently.
+*/
+
+fd_repair_pending_sign_req_t *
+fd_repair_insert_pending_request( fd_repair_t *            repair,
+                                  fd_repair_protocol_t *   protocol,
+                                  uint                     dst_ip_addr,
+                                  ushort                   dst_port,
+                                  enum fd_needed_elem_type type,
+                                  ulong                    slot,
+                                  uint                     shred_index,
+                                  long                     now,
+                                  fd_pubkey_t const *      recipient ) {
+  /* Check if there is any space for a new pending sign request */
+  if( FD_UNLIKELY( fd_repair_pending_sign_req_pool_free( repair->pending_sign_req_pool ) == 0 ) ) {
+    return NULL;
+  }
+
+  fd_repair_pending_sign_req_t * pending = fd_repair_pending_sign_req_pool_ele_acquire( repair->pending_sign_req_pool );
+  if (FD_UNLIKELY( !pending ) ) {
+    return NULL;
+  }
+
+  pending->nonce =       repair->next_nonce;
+
+  fd_repair_pending_sign_req_map_ele_insert( repair->pending_sign_req_map, pending, repair->pending_sign_req_pool );
+
+  fd_repair_construct_request_protocol( repair, protocol, type, slot, shred_index, recipient, repair->next_nonce, now );
+
+  pending->sig_offset =  4;
+  pending->dst_ip_addr = dst_ip_addr;
+  pending->dst_port =    dst_port;
+  pending->recipient =   *recipient;
+
+  repair->metrics.send_pkt_cnt++;
+  repair->next_nonce++;
+  return pending;
+}
+
+fd_repair_pending_sign_req_t *
+fd_repair_query_pending_request( fd_repair_t * repair,
+                                 ulong         nonce ) {
+  return fd_repair_pending_sign_req_map_ele_query( repair->pending_sign_req_map, &nonce, NULL, repair->pending_sign_req_pool );
+}
+
+int
+fd_repair_remove_pending_request( fd_repair_t * repair,
+                                  ulong         nonce ) {
+  fd_repair_pending_sign_req_t * pending = fd_repair_pending_sign_req_map_ele_query( repair->pending_sign_req_map, &nonce, NULL, repair->pending_sign_req_pool );
+  if( FD_UNLIKELY( !pending ) ) {
+    return -1;
+  }
+
+  fd_repair_pending_sign_req_map_ele_remove( repair->pending_sign_req_map, &nonce, NULL, repair->pending_sign_req_pool );
+  fd_repair_pending_sign_req_pool_ele_release( repair->pending_sign_req_pool, pending );
+  return 0;
 }

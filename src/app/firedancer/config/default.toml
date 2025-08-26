@@ -67,10 +67,10 @@ user = ""
     #  +-- vote-account.json
     #  +-- genesis.bin
     #
-    # Two substitutions will be performed on this string.  If "{user}" is
-    # present it will be replaced with the user running Firedancer, as
-    # above, and "{name}" will be replaced with the name of the Firedancer
-    # instance.
+    # Two substitutions will be performed on this string.  If "{user}"
+    # is present it will be replaced with the user running Firedancer,
+    # as above, and "{name}" will be replaced with the name of the
+    # Firedancer instance.
     base = "/home/{user}/.firedancer/{name}"
 
     # Absolute directory path to place the ledger.  If no ledger path is
@@ -329,6 +329,15 @@ user = ""
     # are integrated with gossip
     cluster = "testnet"
 
+    # Controls how many full snapshots are allowed to be kept in the
+    # snapshots directory on disk.
+    #
+    # Firedancer does not currently support creating snapshots, and so
+    # these values are only checked once on boot.  Any excess snapshots
+    # will be deleted, oldest snapshot slot first.
+    max_full_snapshots_to_keep = 1
+    max_incremental_snapshots_to_keep = 1
+
 [rpc]
     # If nonzero, enable JSON RPC on this port, and use the next port
     # for the RPC websocket.  If zero, disable JSON RPC.
@@ -349,11 +358,14 @@ user = ""
     # The shred version is a small hash of the genesis block and any
     # subsequent hard forks.  The validator client uses it to filter
     # out any shred traffic from validators that disagree with this
-    # validator on the genesis hash or the set of hard forks.  If
-    # nonzero, ignore any shreds that have a different shred version
-    # than this value.  If zero, the expected shred version is
-    # automatically determined by copying the shred version that the
-    # entrypoint validator is using.
+    # validator on the genesis hash or the set of hard forks.
+    #
+    # If set to zero, the expected shred version is automatically
+    # determined at startup by requesting the shred version from the
+    # gossip entrypoints.  If set to a nonzero value, the validator will
+    # still request the shred version from the gossip entrypoints, but
+    # if the shred version is not equal to this value, the validator
+    # will abort with an error.
     expected_shred_version = 0
 
 # This section configures the "funk" account database.  Currently, funk
@@ -362,7 +374,7 @@ user = ""
 [funk]
     # The size of the funk heap in gigabytes.  This value must be large
     # enough to store all Solana accounts uncompressed.
-    heap_size_gib = 140
+    heap_size_gib = 40
 
     # The max amount of records that the funk instance can store.
     # Each Solana account uses at least one record.  Additional records
@@ -418,7 +430,25 @@ user = ""
         max_transactions_per_slot = 65536
         snapshot_grace_period_seconds = 409
         max_vote_accounts = 2000000
-        max_banks = 64
+
+        # max_total_banks and max_fork_width are parameters used to size
+        # out the total memory footprint of the bank in the runtime. The
+        # bank represents all of the in-memory state in the runtime that
+        # is not stored as an account. Examples of members of the bank
+        # are the total capitalization of the chain and the vote account
+        # states for previous epochs.
+
+        # max_total_banks specifies the maximum number of unrooted slots
+        # that the firedancer can support. This will define the max
+        # amount of time that the full firedancer client can stay up
+        # without falling over.
+        max_total_banks = 128
+        # max_fork_width specifies the maximum number of forks that will
+        # play through the same slot. Specifically, the maximum number
+        # of forks that will compute the epoch boundary. If the number
+        # of forks that play through the epoch boundary is greater than
+        # max_fork_width, the client will crash.
+        max_fork_width = 32
 
 # This section configures the "groove" persistent account database.
 # [groove]
@@ -439,6 +469,8 @@ user = ""
     # currently 32768 but can be reduced to 1024 once shred sets are
     # restricted to always be size 32).  The default is approximately
     # 1000 banks with this calculation (rounded to nearest power-of-2).
+    #
+    # This value will be rounded up to the nearest power-of-2.
     max_completed_shred_sets = 1_048_576
 
 # CPU cores in Firedancer are carefully managed.  Where a typical
@@ -610,6 +642,21 @@ user = ""
     # denial of service or spam attack.
     verify_tile_count = 6
 
+    # How many gossip verify tiles to run. Gossip verify tiles are
+    # architecturally similar to verify tiles in that inbound Gossip
+    # messages are routed through the gossip verify tiles first before
+    # arriving at the gossip tile (if verified successfully).
+
+    # Likewise, they are designed to be scaled linearly and should be
+    # increased until a favorable drop rate is achieved (~10%) once
+    # the table is nearly fully populated. Large drop rates are expected
+    # during the boot sequence due to the influx of pull responses as a
+    # result of making a pull request from an empty Gossip table. This
+    # can be mitigated by adding more cores, but it is difficult to
+    # avoid completely on mainnet and testnet loads.
+
+    gossvf_tile_count = 1
+
     # How many bank tiles to run.  Should be set to 4 for perf and
     # balanced scheduling modes.  Bank tiles execute transactions, so
     # the validator can include the results of the transaction into a
@@ -633,7 +680,7 @@ user = ""
     bank_tile_count = 1
 
     # TODO: add docs on exec_tile_cnt / exec tile
-    exec_tile_count = 4
+    exec_tile_count = 2
 
     # How many writer tiles to run.  Writer tiles are responsible for
     # writing account changes made by the exec tiles back to the
@@ -649,7 +696,7 @@ user = ""
     # for this to exceed the number of exec tiles, because the number
     # of in-flight transactions between exec tiles and writer tiles is
     # bounded by the number of exec tiles.
-    writer_tile_count = 4
+    writer_tile_count = 1
 
     # How many shred tiles to run.  Should be set to 1.  This is
     # configurable and designed to scale out for future network
@@ -667,6 +714,13 @@ user = ""
     # development and benchmarking, 1 tile is also sufficient to hit
     # very high TPS rates because the cluster size will be very small.
     shred_tile_count = 1
+
+    # How many sign tiles to run. Should be set >= 2. This is
+    # configurable and horizontally scales repair request signing.
+    # One tile is reserved for synchronous signing across all tiles.
+    # The remaining tiles distribute the workload of signing repair
+    # requests.
+    sign_tile_count = 2
 
 # All memory that will be used in Firedancer is pre-allocated in two
 # kinds of pages: huge and gigantic.  Huge pages are 2 MiB and gigantic
@@ -744,21 +798,22 @@ user = ""
     # Firedancer.  Possible values for the option are:
     #
     #  "xdp" (default)
-    #   Use Linux express data path APIs for high performance networking.
-    #   These APIs map memory from the network device directly into
-    #   Firedancer to bypass parts of the kernel when reading and writing
-    #   data.
+    #   Use Linux express data path APIs for high performance
+    #   networking. These APIs map memory from the network device
+    #   directly into Firedancer to bypass parts of the kernel when
+    #   reading and writing data.
     #
     #  "socket"
     #   Use UDP sockets and system calls like `send(2)` for networking.
-    #   Sockets are slower and socket support is provided on a best-effort
-    #   basis.  The socket option is provided as a fallback for hosts which
-    #   do not support XDP, and to support experimental features that are
-    #   not yet implemented in the XDP stack.  Currently, DoubleZero is only
-    #   supported by the socket provider.
+    #   Sockets are slower and socket support is provided on a
+    #   best-effort basis.  The socket option is provided as a fallback
+    #   for hosts which do not support XDP, and to support experimental
+    #   features that are not yet implemented in the XDP stack.
+    #   Currently, DoubleZero is only supported by the socket provider.
     #
-    # Using the XDP networking stack is strongly preferred where possible,
-    # as it is faster and better tested by the development team.
+    # Using the XDP networking stack is strongly preferred where
+    # possible, as it is faster and better tested by the development
+    # team.
     provider = "xdp"
 
     # Which interface to bind to for network traffic.  Currently,
@@ -838,10 +893,10 @@ user = ""
         xdp_rx_queue_size = 32768
         xdp_tx_queue_size = 32768
 
-        # When the oldest packet in a batch has been queued for more than
-        # the specified duration, flushes the batch out to the network
-        # device.  Smaller values improve latency, larger values may
-        # improve throughput.
+        # When the oldest packet in a batch has been queued for more
+        # than the specified duration, flushes the batch out to the
+        # network device.  Smaller values improve latency, larger values
+        # may improve throughput.
         flush_timeout_micros = 20
 
     [net.socket]
@@ -858,17 +913,17 @@ user = ""
 # which CPU core to create a functioning system, below is the individual
 # settings that can change behavior of the tiles.
 [tiles]
-    # The netlink tile forwards Linux network configuration to net tiles.
-    # This config section contains advanced options that typically do not
-    # need to be changed.
-    # For further info, see https://docs.firedancer.io/guide/netlink.html
+    # The netlink tile forwards Linux network configuration to net
+    # tiles.  This config section contains advanced options that
+    # typically do not need to be changed.  For further info, see
+    # https://docs.firedancer.io/guide/netlink.html
     [tiles.netlink]
         # The maximum number of routes per route table.
         #
         # The netlink tile imports two route tables from Linux, namely
-        # `local` and `main`.  You can view them by running
-        # `ip route show table main`.  Decreasing this option can result
-        # in connectivity issues.  Increasing this option can drastically
+        # `local` and `main`.  You can view them by running `ip route
+        # show table main`.  Decreasing this option can result in
+        # connectivity issues.  Increasing this option can drastically
         # decrease performance.
         #
         # For virtually all cloud and bare-metal server providers, the
@@ -884,10 +939,20 @@ user = ""
 
         # The maximum number of Ethernet neighbors.
         #
-        # This should be roughly as large as the size your Ethernet subnet.
-        # E.g. if your IP address is 198.51.100.3/24, then your subnet has
-        # up to 256 neighbors (2^(32-24)).
+        # This should be roughly as large as the size your Ethernet
+        # subnet.  E.g. if your IP address is 198.51.100.3/24, then your
+        # subnet has up to 256 neighbors (2^(32-24)).
         max_neighbors = 4096
+
+    [tiles.gossip]
+        # The maximum number of entries that can be stored in the gossip
+        # table before entries from low stake validators are evicted.
+        #
+        # The gossip protocol periodically expires old entries from the
+        # table, and this number should be set so that the table never
+        # gets full, and all entries expire before they would need to be
+        # evicted.
+        max_entries = 2_097_152
 
     # QUIC tiles are responsible for serving network traffic, including
     # parsing and responding to packets and managing connection timeouts
@@ -1179,7 +1244,7 @@ user = ""
         # To compute an appropriate value, multiply the expected Turbine
         # worst-case latency (tenths of seconds) by the expected
         # transaction rate, and divide by approx 25.
-        max_pending_shred_sets = 512
+        max_pending_shred_sets = 16384
 
         # The shred tile listens on a specific port for shreds to
         # forward.  This argument controls which port that is.  The port
@@ -1217,6 +1282,11 @@ user = ""
 
         # Maximum number of exec slices that can be buffered in the deque.
         max_exec_slices = 65536
+
+    [tiles.send]
+        # The port the send tile uses for QUIC, to send votes and other
+        # transactions. It also uses this as the UDP src port.
+        send_src_port = 9006
 
     # The metric tile receives metrics updates published from the rest
     # of the tiles and serves them via. a Prometheus compatible HTTP
@@ -1368,6 +1438,13 @@ user = ""
         # IP address of the second network namespace.
         interface1_addr = "198.18.0.2"
 
+    [development.gossip]
+        # Under normal operating conditions, a validator should always
+        # reach out to a host located on the public internet.  If this
+        # value is true, it allows the validator to gossip with nodes
+        # located on a private internet (rfc1918).
+        allow_private_address = false
+
     [development.genesis]
         # When creating a new chain from genesis during development,
         # this option can be used to specify the number of hashes in
@@ -1423,12 +1500,12 @@ user = ""
         # one that is used by the bootstrap validator.
         vote_account_stake_lamports = 500000000
 
-        # Setting warmup epochs to true will allow shorter epochs towards
-        # the beginning of the cluster.  This allows for faster stake
-        # activation.  The first epoch will be 32 slots long and the
-        # duration of each subsequent epoch will be double that of the
-        # one before it until it reaches the desired epoch duration of the
-        # cluster.
+        # Setting warmup epochs to true will allow shorter epochs
+        # towards the beginning of the cluster.  This allows for faster
+        # stake activation.  The first epoch will be 32 slots long and
+        # the duration of each subsequent epoch will be double that of
+        # the one before it until it reaches the desired epoch duration
+        # of the cluster.
         warmup_epochs = false
 
     [development.bench]
@@ -1522,20 +1599,21 @@ user = ""
         # This setting overrides [layout.affinity] above.
         affinity = "auto"
 
-        # fake_dst_ip should be set to the IP address of a neighbor on the
-        # Ethernet network.  (For example the router the system is directly
-        # connected to.)
+        # fake_dst_ip should be set to the IP address of a neighbor on
+        # the Ethernet network.  (For example the router the system is
+        # directly connected to.)
         #
-        # The net tile queries the route and neighbor tables as part of the
-        # benchmark.  In short, these resolve the dst MAC address of the
-        # outgoing Ethernet packets.  Since pktgen does not produce IPv4
-        # packets, no traffic actually gets sent to this IP.
+        # The net tile queries the route and neighbor tables as part of
+        # the benchmark.  In short, these resolve the dst MAC address of
+        # the outgoing Ethernet packets.  Since pktgen does not produce
+        # IPv4 packets, no traffic actually gets sent to this IP.
         #
         # The IP address should fulfill these requirements:
         # - 'ip route get <IP>' resolves to the XDP interface
         #   (see [net.interface])
         # - 'ip neigh get <NEXTHOP> dev <INTERFACE>' returns REACHABLE
-        # If these requirements are not met, no packets will be sent out.
+        # If these requirements are not met, no packets will be sent
+        # out.
         fake_dst_ip = ""  # e.g. "192.0.2.64"
 
     # The following options relate to the 'fddev udpecho' tool only.

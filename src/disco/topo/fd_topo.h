@@ -194,6 +194,47 @@ struct fd_topo_tile {
       ulong neigh4_ele_obj_id;     /* neigh4 hash map slots */
     } netlink;
 
+#define FD_TOPO_GOSSIP_ENTRYPOINTS_MAX 16UL
+
+    struct {
+      char identity_key_path[ PATH_MAX ];
+
+      ulong         entrypoints_cnt;
+      fd_ip4_port_t entrypoints[ FD_TOPO_GOSSIP_ENTRYPOINTS_MAX ];
+
+      long boot_timesamp_nanos;
+
+      ulong tcache_depth;
+
+      ushort shred_version;
+      int allow_private_address;
+    } gossvf;
+
+    struct {
+      char identity_key_path[ PATH_MAX ];
+
+      ulong         entrypoints_cnt;
+      fd_ip4_port_t entrypoints[ FD_TOPO_GOSSIP_ENTRYPOINTS_MAX ];
+
+      long boot_timesamp_nanos;
+
+      uint   ip_addr;
+      ushort shred_version;
+
+      ulong  max_entries;
+      ulong  max_purged;
+      ulong  max_failed;
+
+      struct {
+        ushort gossip;
+        ushort tvu;
+        ushort tvu_quic;
+        ushort tpu;
+        ushort tpu_quic;
+        ushort repair;
+      } ports;
+    } gossip;
+
     struct {
       uint   out_depth;
       uint   reasm_cnt;
@@ -264,7 +305,7 @@ struct fd_topo_tile {
       char              identity_key_path[ PATH_MAX ];
       ushort            shred_listen_port;
       int               larger_shred_limits_per_block;
-      ulong             expected_shred_version;
+      ushort            expected_shred_version;
       ulong             adtl_dests_retransmit_cnt;
       fd_topo_ip_port_t adtl_dests_retransmit[ FD_TOPO_ADTL_DESTS_MAX ];
       ulong             adtl_dests_leader_cnt;
@@ -348,10 +389,13 @@ struct fd_topo_tile {
       int   dump_instr_to_pb;
       int   dump_txn_to_pb;
       int   dump_syscall_to_pb;
+      int   dump_elf_to_pb;
     } exec;
 
     struct {
       ulong funk_obj_id;
+      char  solcap_capture[ PATH_MAX ];
+      ulong capture_start_slot;
     } writer;
 
     struct {
@@ -372,21 +416,6 @@ struct fd_topo_tile {
       float contending_fraction;
       float cu_price_spread;
     } benchg;
-
-    struct {
-      ushort  gossip_listen_port;
-#     define FD_TOPO_GOSSIP_ENTRYPOINTS_MAX 16
-      ulong   entrypoints_cnt;
-      fd_ip4_port_t entrypoints[ FD_TOPO_GOSSIP_ENTRYPOINTS_MAX ];
-      uint    ip_addr;
-      char    identity_key_path[ PATH_MAX ];
-      ushort  tvu_port;
-      ushort  tpu_port;
-      ushort  tpu_quic_port;
-      ushort  tpu_vote_port;
-      ushort  repair_serve_port;
-      ulong   expected_shred_version;
-    } gossip;
 
     struct {
       ushort  repair_intake_listen_port;
@@ -428,6 +457,7 @@ struct fd_topo_tile {
 
     struct {
       ulong   funk_obj_id;
+      ulong   store_obj_id;
       ushort  rpc_port;
       ushort  tpu_port;
       uint    tpu_ip_addr;
@@ -462,6 +492,8 @@ struct fd_topo_tile {
       char   folder_path[ PATH_MAX ];
       ushort repair_intake_listen_port;
       ulong   write_buffer_size; /* Size of the write buffer for the capture tile */
+      int    enable_publish_stake_weights;
+      char   manifest_path[ PATH_MAX ];
 
       /* Set internally by the capture tile */
       int shreds_fd;
@@ -480,11 +512,22 @@ struct fd_topo_tile {
       uint  maximum_local_snapshot_age;
       uint  minimum_download_speed_mib;
       uint  maximum_download_retry_abort;
+      uint  max_full_snapshots_to_keep;
+      uint  max_incremental_snapshots_to_keep;
     } snaprd;
 
     struct {
       ulong funk_obj_id;
     } snapin;
+
+    struct {
+      uint   bind_address;
+      ushort bind_port;
+
+      ushort expected_shred_version;
+      ulong entrypoints_cnt;
+      fd_ip4_port_t entrypoints[ FD_TOPO_GOSSIP_ENTRYPOINTS_MAX ];
+    } ipecho;
 
   };
 };

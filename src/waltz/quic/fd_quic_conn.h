@@ -2,6 +2,7 @@
 #define HEADER_fd_src_waltz_quic_fd_quic_conn_h
 
 #include "fd_quic.h"
+#include "fd_quic_common.h"
 #include "fd_quic_ack_tx.h"
 #include "fd_quic_stream.h"
 #include "fd_quic_conn_id.h"
@@ -17,6 +18,11 @@
 #define FD_QUIC_CONN_STATE_ABORT              5 /* connection terminating due to error */
 #define FD_QUIC_CONN_STATE_CLOSE_PENDING      6 /* connection is closing */
 #define FD_QUIC_CONN_STATE_DEAD               7 /* connection about to be freed */
+#define FD_QUIC_CONN_STATE_TIMED_OUT          8 /* connection timed out but kept for reuse */
+#define FD_QUIC_CONN_STATE_COUNT              9
+
+FD_STATIC_ASSERT( FD_QUIC_CONN_STATE_COUNT == sizeof((fd_quic_metrics_t){0}.conn_state_cnt)/sizeof((fd_quic_metrics_t){0}.conn_state_cnt[0]),
+                  "metrics conn_state_cnt is the wrong size" );
 
 #define FD_QUIC_REASON_CODES(X,SEP) \
   X(NO_ERROR                     , 0x00  , "No error"                                  ) SEP \
@@ -90,7 +96,7 @@ struct fd_quic_conn {
   /* Service queue dlist membership.  All active conns (state not INVALID)
      are in a service queue, FD_QUIC_SVC_TYPE_WAIT by default.
      Free conns (svc_type==UINT_MAX) are members of a singly linked list
-     (only src_next set) */
+     (only svc_next set). */
   uint               svc_type;  /* FD_QUIC_SVC_{...} or UINT_MAX */
   uint               svc_prev;
   uint               svc_next;
@@ -228,12 +234,6 @@ struct fd_quic_conn {
   ulong used_pkt_meta;
 };
 
-inline static void
-fd_quic_set_conn_state( fd_quic_conn_t * conn,
-                        uint             state ) {
-  conn->state = state;
-}
-
 FD_PROTOTYPES_BEGIN
 
 FD_FN_CONST static inline ulong
@@ -265,6 +265,22 @@ fd_quic_conn_t *
 fd_quic_conn_new( void *                   mem,
                   fd_quic_t *              quic,
                   fd_quic_limits_t const * limits );
+
+/* clears all non-persistent members of the connection object */
+static inline void
+fd_quic_conn_clear( fd_quic_conn_t * conn ) {
+  fd_quic_t            * quic       = conn->quic;
+  uint                   conn_state = conn->state;
+  uint                   conn_idx   = conn->conn_idx;
+  fd_quic_stream_map_t * stream_map = conn->stream_map;
+
+  fd_memset( conn, 0, sizeof( fd_quic_conn_t ) );
+
+  conn->quic       = quic;
+  conn->state      = conn_state;
+  conn->conn_idx   = conn_idx;
+  conn->stream_map = stream_map;
+}
 
 /* set the user-defined context value on the connection */
 void

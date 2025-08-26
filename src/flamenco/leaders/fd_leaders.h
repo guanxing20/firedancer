@@ -95,6 +95,8 @@ fd_epoch_leaders_footprint( ulong pub_cnt,
    pub_cnt is the number of unique public keys in this schedule.
    `stakes` points to the first entry of pub_cnt entries of stake
    weights sorted by tuple (stake, pubkey) in descending order.
+   `vote_keyed_lsched` is either 0 or 1, when 1 the leader schedule
+   is computed by vote accounts (see SIMD-0180).
 
    If `stakes` does not include all staked nodes, e.g. in the case of an
    attack that swamps the network with fake validators, `stakes` should
@@ -148,6 +150,7 @@ fd_epoch_leaders_delete( void * shleaders );
 FD_FN_PURE static inline fd_pubkey_t const *
 fd_epoch_leaders_get( fd_epoch_leaders_t const * leaders,
                       ulong                      slot ) {
+  if( FD_UNLIKELY( leaders==NULL ) ) return NULL;
   ulong slot_delta = slot - leaders->slot0;
   if( FD_UNLIKELY( slot      < leaders->slot0    ) ) return NULL;
   if( FD_UNLIKELY( slot_delta>=leaders->slot_cnt ) ) return NULL;

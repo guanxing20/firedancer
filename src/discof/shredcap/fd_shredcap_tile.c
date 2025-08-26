@@ -4,8 +4,16 @@
 #include "../../flamenco/types/fd_types.h"
 #include "../../flamenco/fd_flamenco_base.h"
 #include "../../util/pod/fd_pod_format.h"
+#include "../../flamenco/gossip/fd_gossip_types.h"
 #include "../../disco/fd_disco.h"
 #include "../../discof/fd_discof.h"
+#include "../../discof/restore/utils/fd_ssmsg.h"
+#include "../../discof/restore/utils/fd_ssmanifest_parser.h"
+#include "../../flamenco/stakes/fd_stakes.h"
+#include "../../flamenco/runtime/sysvar/fd_sysvar_epoch_schedule.h"
+#include "../../disco/fd_disco.h"
+#include "../../util/pod/fd_pod_format.h"
+#include "../replay/fd_exec.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -33,14 +41,15 @@
 #define FD_SHREDCAP_DEFAULT_WRITER_BUF_SZ  (4096UL)  /* local filesystem block size */
 #define FD_SHREDCAP_ALLOC_TAG              (4UL)
 #define MAX_BUFFER_SIZE                    (20000UL * sizeof(fd_shred_dest_wire_t))
+#define MANIFEST_MAX_TOTAL_BANKS           (2UL) /* the minimum is 2 */
+#define MANIFEST_MAX_FORK_WIDTH            (1UL) /* banks are only needed during publish_stake_weights() */
 
 #define NET_SHRED        (0UL)
 #define REPAIR_NET       (1UL)
 #define SHRED_REPAIR     (2UL)
-#define GOSSIP_SHRED     (3UL)
-#define GOSSIP_REPAIR    (4UL)
-#define REPAIR_SHRED_CAP (5UL)
-#define REPLAY_SHRED_CAP (6UL)
+#define GOSSIP_OUT       (3UL)
+#define REPAIR_SHREDCAP (4UL)
+#define REPLAY_SHREDCAP (5UL)
 
 typedef union {
   struct {
@@ -50,6 +59,19 @@ typedef union {
   };
   fd_net_rx_bounds_t net_rx;
 } fd_capture_in_ctx_t;
+
+struct out_link {
+  ulong       idx;
+  fd_frag_meta_t * mcache;
+  ulong *          sync;
+  ulong            depth;
+  ulong            seq;
+  fd_wksp_t * mem;
+  ulong       chunk0;
+  ulong       wmark;
+  ulong       chunk;
+};
+typedef struct out_link out_link_t;
 
 struct fd_capture_tile_ctx {
   uchar               in_kind[ 32 ];
@@ -63,6 +85,20 @@ struct fd_capture_tile_ctx {
 
   ulong repair_buffer_sz;
   uchar repair_buffer[ FD_NET_MTU ];
+
+  out_link_t           stake_out[1];
+  out_link_t           snap_out[1];
+  int                  enable_publish_stake_weights;
+  ulong *              manifest_wmark;
+  uchar *              manifest_bank_mem;
+  uchar *              mainfest_exec_slot_ctx_mem;
+  fd_exec_slot_ctx_t * manifest_exec_slot_ctx;
+  char                 manifest_path[ PATH_MAX ];
+  int                  manifest_load_done;
+  uchar *              manifest_spad_mem;
+  fd_spad_t *          manifest_spad;
+  uchar *              shared_spad_mem;
+  fd_spad_t *          shared_spad;
 
   fd_ip4_udp_hdrs_t intake_hdr[1];
 
@@ -103,10 +139,67 @@ scratch_align( void ) {
   return 4096UL;
 }
 
+FD_FN_CONST static inline ulong
+manifest_bank_align( void ) {
+  return fd_banks_align();
+}
+
+FD_FN_CONST static inline ulong
+manifest_bank_footprint( void ) {
+  return fd_banks_footprint( MANIFEST_MAX_TOTAL_BANKS, MANIFEST_MAX_FORK_WIDTH );
+}
+
+FD_FN_CONST static inline ulong
+manifest_load_align( void ) {
+  return 128UL;
+}
+
+FD_FN_CONST static inline ulong
+manifest_load_footprint( void ) {
+  /* A manifest typically requires 1GB, but closer to 2GB
+     have been observed in mainnet.  The footprint is then
+     set to 2GB.  TODO a future adjustment may be needed. */
+  return 2UL * FD_SHMEM_GIGANTIC_PAGE_SZ;
+}
+
+FD_FN_CONST static inline ulong
+manifest_spad_max_alloc_align( void ) {
+  return FD_SPAD_ALIGN;
+}
+
+FD_FN_CONST static inline ulong
+manifest_spad_max_alloc_footprint( void ) {
+  /* The amount of memory required in the manifest load
+     scratchpad to process it tends to be slightly larger
+     than the manifest load footprint. */
+  return manifest_load_footprint() + 128UL * FD_SHMEM_HUGE_PAGE_SZ;
+}
+
+FD_FN_CONST static inline ulong
+shared_spad_max_alloc_align( void ) {
+  return FD_SPAD_ALIGN;
+}
+
+FD_FN_CONST static inline ulong
+shared_spad_max_alloc_footprint( void ) {
+  /* The shared scratchpad is used by the manifest banks
+     and by the manifest load (but not at the same time).
+     The footprint for the banks needs to be equal to
+     banks footprint (at least for the current setup with
+     MANIFEST_MAX_TOTAL_BANKS==2). */
+  return fd_ulong_max( manifest_bank_footprint(), manifest_load_footprint() );
+}
+
 FD_FN_PURE static inline ulong
 loose_footprint( fd_topo_tile_t const * tile FD_PARAM_UNUSED ) {
-  return 1UL * FD_SHMEM_GIGANTIC_PAGE_SZ;
+  ulong footprint = sizeof(fd_capture_tile_ctx_t) + FD_EXEC_SLOT_CTX_FOOTPRINT
+                    + manifest_bank_footprint()
+                    + fd_spad_footprint( manifest_spad_max_alloc_footprint() )
+                    + fd_spad_footprint( shared_spad_max_alloc_footprint() )
+                    + fd_alloc_footprint();
+  return fd_ulong_align_up( footprint, FD_SHMEM_GIGANTIC_PAGE_SZ );
 }
+
 
 static ulong
 populate_allowed_seccomp( fd_topo_t const *      topo FD_PARAM_UNUSED,
@@ -123,14 +216,41 @@ populate_allowed_seccomp( fd_topo_t const *      topo FD_PARAM_UNUSED,
   return sock_filter_policy_fd_shredcap_tile_instr_cnt;
 }
 
-
 FD_FN_PURE static inline ulong
 scratch_footprint( fd_topo_tile_t const * tile ) {
   (void)tile;
   ulong l = FD_LAYOUT_INIT;
-  l = FD_LAYOUT_APPEND( l, alignof(fd_capture_tile_ctx_t), sizeof(fd_capture_tile_ctx_t) );
-  l = FD_LAYOUT_APPEND( l, fd_alloc_align(), fd_alloc_footprint() );
+  l = FD_LAYOUT_APPEND( l, alignof(fd_capture_tile_ctx_t),  sizeof(fd_capture_tile_ctx_t) );
+  l = FD_LAYOUT_APPEND( l, FD_EXEC_SLOT_CTX_ALIGN,          FD_EXEC_SLOT_CTX_FOOTPRINT );
+  l = FD_LAYOUT_APPEND( l, manifest_bank_align(),           manifest_bank_footprint() );
+  l = FD_LAYOUT_APPEND( l, manifest_spad_max_alloc_align(), fd_spad_footprint( manifest_spad_max_alloc_footprint() ) );
+  l = FD_LAYOUT_APPEND( l, shared_spad_max_alloc_align(),   fd_spad_footprint( shared_spad_max_alloc_footprint() ) );
+  l = FD_LAYOUT_APPEND( l, fd_alloc_align(),                fd_alloc_footprint() );
   return FD_LAYOUT_FINI( l, scratch_align() );
+}
+
+static void
+publish_stake_weights_manifest( fd_capture_tile_ctx_t * ctx,
+                                fd_stem_context_t *    stem,
+                                fd_snapshot_manifest_t const * manifest ) {
+  fd_epoch_schedule_t const * schedule = fd_type_pun_const( &manifest->epoch_schedule_params );
+  ulong epoch = fd_slot_to_epoch( schedule, manifest->slot, NULL );
+
+  /* current epoch */
+  ulong * stake_weights_msg = fd_chunk_to_laddr( ctx->stake_out->mem, ctx->stake_out->chunk );
+  ulong stake_weights_sz = generate_stake_weight_msg_manifest( epoch, schedule, &manifest->epoch_stakes[0], stake_weights_msg );
+  ulong stake_weights_sig = 4UL;
+  fd_stem_publish( stem, 0UL, stake_weights_sig, ctx->stake_out->chunk, stake_weights_sz, 0UL, 0UL, fd_frag_meta_ts_comp( fd_tickcount() ) );
+  ctx->stake_out->chunk = fd_dcache_compact_next( ctx->stake_out->chunk, stake_weights_sz, ctx->stake_out->chunk0, ctx->stake_out->wmark );
+  FD_LOG_NOTICE(("sending current epoch stake weights - epoch: %lu, stake_weight_cnt: %lu, start_slot: %lu, slot_cnt: %lu", stake_weights_msg[0], stake_weights_msg[1], stake_weights_msg[2], stake_weights_msg[3]));
+
+  /* next current epoch */
+  stake_weights_msg = fd_chunk_to_laddr( ctx->stake_out->mem, ctx->stake_out->chunk );
+  stake_weights_sz = generate_stake_weight_msg_manifest( epoch + 1, schedule, &manifest->epoch_stakes[1], stake_weights_msg );
+  stake_weights_sig = 4UL;
+  fd_stem_publish( stem, 0UL, stake_weights_sig, ctx->stake_out->chunk, stake_weights_sz, 0UL, 0UL, fd_frag_meta_ts_comp( fd_tickcount() ) );
+  ctx->stake_out->chunk = fd_dcache_compact_next( ctx->stake_out->chunk, stake_weights_sz, ctx->stake_out->chunk0, ctx->stake_out->wmark );
+  FD_LOG_NOTICE(("sending next epoch stake weights - epoch: %lu, stake_weight_cnt: %lu, start_slot: %lu, slot_cnt: %lu", stake_weights_msg[0], stake_weights_msg[1], stake_weights_msg[2], stake_weights_msg[3]));
 }
 
 static inline int
@@ -139,35 +259,41 @@ before_frag( fd_capture_tile_ctx_t * ctx,
              ulong            seq FD_PARAM_UNUSED,
              ulong            sig ) {
   if( FD_LIKELY( ctx->in_kind[ in_idx ]==NET_SHRED ) ) {
-    return (fd_disco_netmux_sig_proto( sig )!=DST_PROTO_SHRED) & (fd_disco_netmux_sig_proto( sig )!=DST_PROTO_REPAIR);
+    return (int)(fd_disco_netmux_sig_proto( sig )!=DST_PROTO_SHRED) & (int)(fd_disco_netmux_sig_proto( sig )!=DST_PROTO_REPAIR);
+  } else if( FD_UNLIKELY( ctx->in_kind[ in_idx ]==GOSSIP_OUT)) {
+    return sig!=FD_GOSSIP_UPDATE_TAG_CONTACT_INFO;
   }
   return 0;
 }
 
 static inline void
-handle_new_turbine_contact_info( fd_capture_tile_ctx_t * ctx,
-                                 uchar const *          buf ) {
-  ulong const * header = (ulong const *)fd_type_pun_const( buf );
-  ulong dest_cnt = header[ 0 ];
+handle_new_contact_info( fd_capture_tile_ctx_t * ctx,
+                         uchar const *           buf ) {
+  fd_gossip_update_message_t const * msg = (fd_gossip_update_message_t const *)fd_type_pun_const( buf );
+  char tvu_buf[1024];
+  char repair_buf[1024];
+  fd_ip4_port_t tvu    = msg->contact_info.contact_info->sockets[ FD_CONTACT_INFO_SOCKET_TVU ];
+  fd_ip4_port_t repair = msg->contact_info.contact_info->sockets[ FD_CONTACT_INFO_SOCKET_SERVE_REPAIR ];
 
-  fd_shred_dest_wire_t const * in_dests = fd_type_pun_const( header+1UL );
-
-  for( ulong i=0UL; i<dest_cnt; i++ ) {
-    // need to bswap the port
-    //ushort port = fd_ushort_bswap( in_dests[i].udp_port );
-    char peers_buf[1024];
-    snprintf( peers_buf, sizeof(peers_buf),
-              "%u,%u,%s,%d\n",
-              in_dests[i].ip4_addr, in_dests[i].udp_port, FD_BASE58_ENC_32_ALLOCA(in_dests[i].pubkey), 1);
-    int err = fd_io_buffered_ostream_write( &ctx->peers_ostream, peers_buf, strlen(peers_buf) );
+  if( FD_UNLIKELY( tvu.l!=0UL ) ){
+    snprintf( tvu_buf, sizeof(tvu_buf),
+              "%u,%u(tvu),%s,%d\n",
+              tvu.addr, tvu.port, FD_BASE58_ENC_32_ALLOCA(msg->contact_info.contact_info->pubkey.uc), 1);
+    int err = fd_io_buffered_ostream_write( &ctx->peers_ostream, tvu_buf, strlen(tvu_buf) );
+    FD_TEST( err==0 );
+  }
+  if( FD_UNLIKELY( repair.l!=0UL ) ){
+    snprintf( repair_buf, sizeof(repair_buf),
+              "%u,%u(repair),%s,%d\n",
+              repair.addr, repair.port, FD_BASE58_ENC_32_ALLOCA(msg->contact_info.contact_info->pubkey.uc), 1);
+    int err = fd_io_buffered_ostream_write( &ctx->peers_ostream, repair_buf, strlen(repair_buf) );
     FD_TEST( err==0 );
   }
 }
 
-
 static int
 is_fec_completes_msg( ulong sz ) {
-  return sz == FD_SHRED_DATA_HEADER_SZ + FD_SHRED_MERKLE_ROOT_SZ;
+  return sz == FD_SHRED_DATA_HEADER_SZ + 2*FD_SHRED_MERKLE_ROOT_SZ;
 }
 
 static inline void
@@ -221,9 +347,12 @@ during_frag( fd_capture_tile_ctx_t * ctx,
     }
     fd_memcpy( ctx->repair_buffer, dcache_entry, sz );
     ctx->repair_buffer_sz = sz;
-  } else if( ctx->in_kind[ in_idx ] == REPAIR_SHRED_CAP ) {
+  } else if( ctx->in_kind[ in_idx ] == REPAIR_SHREDCAP ) {
 
     uchar const * dcache_entry = fd_chunk_to_laddr_const( ctx->in_links[ in_idx ].mem, chunk );
+
+    /* FIXME this should all be happening in after_frag */
+
     /* We expect to get all of the data shreds in a batch at once.  When
        we do we will write the header, the shreds, and a trailer. */
     ulong payload_sz = sig;
@@ -250,7 +379,9 @@ during_frag( fd_capture_tile_ctx_t * ctx,
       FD_LOG_CRIT(( "failed to write slice trailer %d", err ));
     }
 
-  } else if( ctx->in_kind[ in_idx ] == REPLAY_SHRED_CAP ) {
+  } else if( ctx->in_kind[ in_idx ] == REPLAY_SHREDCAP ) {
+
+    /* FIXME this should all be happening in after_frag */
 
    uchar const * dcache_entry = fd_chunk_to_laddr_const( ctx->in_links[ in_idx ].mem, chunk );
    fd_shredcap_bank_hash_msg_t bank_hash_msg = {
@@ -270,6 +401,65 @@ during_frag( fd_capture_tile_ctx_t * ctx,
     }
     uchar const * dcache_entry = fd_chunk_to_laddr_const( ctx->in_links[ in_idx ].mem, chunk );
     fd_memcpy( ctx->contact_info_buffer, dcache_entry, sz );
+  }
+}
+
+static void
+after_credit( fd_capture_tile_ctx_t * ctx,
+              fd_stem_context_t *     stem,
+              int *                   opt_poll_in FD_PARAM_UNUSED,
+              int *                   charge_busy FD_PARAM_UNUSED ) {
+
+  if( FD_UNLIKELY( !ctx->manifest_load_done ) ) {
+    if( FD_LIKELY( !!strcmp( ctx->manifest_path, "") ) ) {
+      /* ctx->manifest_spad will hold the processed manifest. */
+      fd_spad_reset( ctx->manifest_spad );
+      /* do not pop from ctx->manifest_spad, the manifest needs
+         to remain available until a new manifest is processed. */
+
+      int fd = open( ctx->manifest_path, O_RDONLY );
+      if( FD_UNLIKELY( fd < 0 ) ) {
+        FD_LOG_WARNING(( "open(%s) failed (%d-%s)", ctx->manifest_path, errno, fd_io_strerror( errno ) ));
+        return;
+      }
+      FD_LOG_NOTICE(( "manifest %s.", ctx->manifest_path ));
+
+      fd_snapshot_manifest_t * manifest = NULL;
+      FD_SPAD_FRAME_BEGIN( ctx->manifest_spad ) {
+        manifest = fd_spad_alloc( ctx->manifest_spad, alignof(fd_snapshot_manifest_t), sizeof(fd_snapshot_manifest_t) );
+      } FD_SPAD_FRAME_END;
+      FD_TEST( manifest );
+
+      FD_SPAD_FRAME_BEGIN( ctx->shared_spad ) {
+        uchar * buf    = fd_spad_alloc( ctx->shared_spad, manifest_load_align(), manifest_load_footprint() );
+        ulong   buf_sz = 0;
+        FD_TEST( !fd_io_read( fd, buf/*dst*/, 0/*dst_min*/, manifest_load_footprint()-1UL /*dst_max*/, &buf_sz ) );
+
+        fd_ssmanifest_parser_t * parser = fd_ssmanifest_parser_join( fd_ssmanifest_parser_new( aligned_alloc(
+                fd_ssmanifest_parser_align(), fd_ssmanifest_parser_footprint( 1UL<<24UL ) ), 1UL<<24UL, 42UL ) );
+        FD_TEST( parser );
+        fd_ssmanifest_parser_init( parser, manifest );
+        int parser_err = fd_ssmanifest_parser_consume( parser, buf, buf_sz );
+        if( FD_UNLIKELY( parser_err ) ) FD_LOG_ERR(( "fd_ssmanifest_parser_consume failed (%d)", parser_err ));
+      } FD_SPAD_FRAME_END;
+      FD_LOG_NOTICE(( "manifest bank slot %lu", manifest->slot ));
+
+      fd_fseq_update( ctx->manifest_wmark, manifest->slot );
+
+      uchar * chunk = fd_chunk_to_laddr( ctx->snap_out->mem, ctx->snap_out->chunk );
+      ulong   sz    = sizeof(fd_snapshot_manifest_t);
+      ulong   sig   = fd_ssmsg_sig( FD_SSMSG_MANIFEST_INCREMENTAL );
+      memcpy( chunk, manifest, sz );
+      fd_stem_publish( stem, ctx->snap_out->idx, sig, ctx->snap_out->chunk, sz, 0UL, 0UL, fd_frag_meta_ts_comp( fd_tickcount() ) );
+      ctx->snap_out->chunk = fd_dcache_compact_next( ctx->snap_out->chunk, sz, ctx->snap_out->chunk0, ctx->snap_out->wmark );
+
+      fd_stem_publish( stem, ctx->snap_out->idx, fd_ssmsg_sig( FD_SSMSG_DONE ), 0UL, 0UL, 0UL, 0UL, 0UL );
+
+      publish_stake_weights_manifest( ctx, stem, manifest );
+      //*charge_busy = 0;
+    }
+    /* No need to strcmp every time after_credit is called. */
+    ctx->manifest_load_done = 1;
   }
 }
 
@@ -380,19 +570,8 @@ after_frag( fd_capture_tile_ctx_t * ctx,
               peer_ip4_addr, peer_port, fd_log_wallclock(), nonce, slot, shred_index );
     int err = fd_io_buffered_ostream_write( &ctx->repair_ostream, repair_data_buf, strlen(repair_data_buf) );
     FD_TEST( err==0 );
-  } else if( ctx->in_kind[ in_idx ] == GOSSIP_REPAIR ) {
-    fd_shred_dest_wire_t const * in_dests = (fd_shred_dest_wire_t const *)fd_type_pun_const( ctx->contact_info_buffer );
-    ulong dest_cnt = sz;
-    for( ulong i=0UL; i<dest_cnt; i++ ) {
-      char peers_buf[1024];
-      snprintf( peers_buf, sizeof(peers_buf),
-                "%u,%u,%s,%d\n",
-                 in_dests[i].ip4_addr, in_dests[i].udp_port, FD_BASE58_ENC_32_ALLOCA(in_dests[i].pubkey), 0);
-      int err = fd_io_buffered_ostream_write( &ctx->peers_ostream, peers_buf, strlen(peers_buf) );
-      FD_TEST( err==0 );
-    }
-  } else if( ctx->in_kind[ in_idx ] == GOSSIP_SHRED ) { // crds_shred contact infos
-    handle_new_turbine_contact_info( ctx, ctx->contact_info_buffer );
+  } else if( ctx->in_kind[ in_idx ] == GOSSIP_OUT ) {
+    handle_new_contact_info( ctx, ctx->contact_info_buffer );
   }
 }
 
@@ -510,8 +689,12 @@ unprivileged_init( fd_topo_t *      topo,
 
   void * scratch = fd_topo_obj_laddr( topo, tile->tile_obj_id );
   FD_SCRATCH_ALLOC_INIT( l, scratch );
-  fd_capture_tile_ctx_t * ctx = FD_SCRATCH_ALLOC_APPEND( l, alignof(fd_capture_tile_ctx_t), sizeof(fd_capture_tile_ctx_t) );
-  void * alloc_mem            = FD_SCRATCH_ALLOC_APPEND( l, fd_alloc_align(), fd_alloc_footprint() );
+  fd_capture_tile_ctx_t * ctx       = FD_SCRATCH_ALLOC_APPEND( l, alignof(fd_capture_tile_ctx_t),  sizeof(fd_capture_tile_ctx_t) );
+  void * mainfest_exec_slot_ctx_mem = FD_SCRATCH_ALLOC_APPEND( l, FD_EXEC_SLOT_CTX_ALIGN,          FD_EXEC_SLOT_CTX_FOOTPRINT );
+  void * manifest_bank_mem          = FD_SCRATCH_ALLOC_APPEND( l, manifest_bank_align(),           manifest_bank_footprint() );
+  void * manifest_spad_mem          = FD_SCRATCH_ALLOC_APPEND( l, manifest_spad_max_alloc_align(), fd_spad_footprint( manifest_spad_max_alloc_footprint() ) );
+  void * shared_spad_mem            = FD_SCRATCH_ALLOC_APPEND( l, shared_spad_max_alloc_align(),   fd_spad_footprint( shared_spad_max_alloc_footprint() ) );
+  void * alloc_mem                  = FD_SCRATCH_ALLOC_APPEND( l, fd_alloc_align(),                fd_alloc_footprint() );
   FD_SCRATCH_ALLOC_FINI( l, scratch_align() );
 
   /* Input links */
@@ -526,16 +709,14 @@ unprivileged_init( fd_topo_t *      topo,
       ctx->in_kind[ i ] = REPAIR_NET;
     } else if( 0==strcmp( link->name, "shred_repair" ) ) {
       ctx->in_kind[ i ] = SHRED_REPAIR;
-    } else if( 0==strcmp( link->name, "crds_shred" ) ) {
-      ctx->in_kind[ i ] = GOSSIP_SHRED;
-    } else if( 0==strcmp( link->name, "gossip_repai" ) ) {
-      ctx->in_kind[ i ] = GOSSIP_REPAIR;
+    } else if( 0==strcmp( link->name, "gossip_out" ) ) {
+      ctx->in_kind[ i ] = GOSSIP_OUT;
     } else if( 0==strcmp( link->name, "repair_scap" ) ) {
-      ctx->in_kind[ i ] = REPAIR_SHRED_CAP;
+      ctx->in_kind[ i ] = REPAIR_SHREDCAP;
     } else if( 0==strcmp( link->name, "replay_scap" ) ) {
-      ctx->in_kind[ i ] = REPLAY_SHRED_CAP;
+      ctx->in_kind[ i ] = REPLAY_SHREDCAP;
     } else {
-      FD_LOG_ERR(( "repair tile has unexpected input link %s", link->name ));
+      FD_LOG_ERR(( "scap tile has unexpected input link %s", link->name ));
     }
 
     ctx->in_links[ i ].mem    = link_wksp->wksp;
@@ -545,6 +726,66 @@ unprivileged_init( fd_topo_t *      topo,
 
   ctx->repair_intake_listen_port = tile->shredcap.repair_intake_listen_port;
   ctx->write_buf_sz = tile->shredcap.write_buffer_size ? tile->shredcap.write_buffer_size : FD_SHREDCAP_DEFAULT_WRITER_BUF_SZ;
+
+  /* Set up stake weights tile output */
+  ctx->stake_out->idx       = fd_topo_find_tile_out_link( topo, tile, "stake_out", 0 );
+  if( FD_LIKELY( ctx->stake_out->idx!=ULONG_MAX ) ) {
+    fd_topo_link_t * stake_weights_out = &topo->links[ tile->out_link_id[ ctx->stake_out->idx] ];
+    ctx->stake_out->mcache  = stake_weights_out->mcache;
+    ctx->stake_out->mem     = topo->workspaces[ topo->objs[ stake_weights_out->dcache_obj_id ].wksp_id ].wksp;
+    ctx->stake_out->sync    = fd_mcache_seq_laddr     ( ctx->stake_out->mcache );
+    ctx->stake_out->depth   = fd_mcache_depth         ( ctx->stake_out->mcache );
+    ctx->stake_out->seq     = fd_mcache_seq_query     ( ctx->stake_out->sync );
+    ctx->stake_out->chunk0  = fd_dcache_compact_chunk0( ctx->stake_out->mem, stake_weights_out->dcache );
+    ctx->stake_out->wmark   = fd_dcache_compact_wmark ( ctx->stake_out->mem, stake_weights_out->dcache, stake_weights_out->mtu );
+    ctx->stake_out->chunk   = ctx->stake_out->chunk0;
+  } else {
+    FD_LOG_WARNING(( "no connection to stake_out link" ));
+    memset( ctx->stake_out, 0, sizeof(out_link_t) );
+  }
+
+  ctx->snap_out->idx          = fd_topo_find_tile_out_link( topo, tile, "snap_out", 0 );
+  if( FD_LIKELY( ctx->snap_out->idx!=ULONG_MAX ) ) {
+    fd_topo_link_t * snap_out = &topo->links[tile->out_link_id[ctx->snap_out->idx]];
+    ctx->snap_out->mem        = topo->workspaces[topo->objs[snap_out->dcache_obj_id].wksp_id].wksp;
+    ctx->snap_out->chunk0     = fd_dcache_compact_chunk0( ctx->snap_out->mem, snap_out->dcache );
+    ctx->snap_out->wmark      = fd_dcache_compact_wmark( ctx->snap_out->mem, snap_out->dcache, snap_out->mtu );
+    ctx->snap_out->chunk      = ctx->snap_out->chunk0;
+  } else {
+    FD_LOG_WARNING(( "no connection to snap_out link" ));
+    memset( ctx->snap_out, 0, sizeof(out_link_t) );
+  }
+
+  /* If the manifest is enabled (for processing), the stake_out link
+     must be connected to the tile.  TODO in principle, it should be
+     possible to gate the remaining of the manifest-related config. */
+  ctx->enable_publish_stake_weights = tile->shredcap.enable_publish_stake_weights;
+  FD_LOG_NOTICE(( "enable_publish_stake_weights ? %d", ctx->enable_publish_stake_weights ));
+
+  /* manifest_wmark (root slot) */
+  ulong root_slot_obj_id = fd_pod_queryf_ulong( topo->props, ULONG_MAX, "root_slot" );
+  if( FD_LIKELY( root_slot_obj_id!=ULONG_MAX ) ) { /* for profiler */
+    ctx->manifest_wmark = fd_fseq_join( fd_topo_obj_laddr( topo, root_slot_obj_id ) );
+    if( FD_UNLIKELY( !ctx->manifest_wmark ) ) FD_LOG_ERR(( "no root_slot fseq" ));
+    FD_TEST( ULONG_MAX==fd_fseq_query( ctx->manifest_wmark ) );
+  }
+
+  ctx->manifest_bank_mem    = manifest_bank_mem;
+
+  ctx->mainfest_exec_slot_ctx_mem    = mainfest_exec_slot_ctx_mem;
+  ctx->manifest_exec_slot_ctx        = fd_exec_slot_ctx_join( fd_exec_slot_ctx_new( ctx->mainfest_exec_slot_ctx_mem  ) );
+  FD_TEST( ctx->manifest_exec_slot_ctx );
+  ctx->manifest_exec_slot_ctx->banks = fd_banks_join( fd_banks_new( ctx->manifest_bank_mem, MANIFEST_MAX_TOTAL_BANKS, MANIFEST_MAX_FORK_WIDTH ) );
+  FD_TEST( ctx->manifest_exec_slot_ctx->banks );
+  ctx->manifest_exec_slot_ctx->bank  = fd_banks_init_bank( ctx->manifest_exec_slot_ctx->banks, 0UL );
+  FD_TEST( ctx->manifest_exec_slot_ctx->bank );
+
+  strncpy( ctx->manifest_path, tile->shredcap.manifest_path, PATH_MAX );
+  ctx->manifest_load_done   = 0;
+  ctx->manifest_spad_mem    = manifest_spad_mem;
+  ctx->manifest_spad        = fd_spad_join( fd_spad_new( ctx->manifest_spad_mem, manifest_spad_max_alloc_footprint() ) );
+  ctx->shared_spad_mem      = shared_spad_mem;
+  ctx->shared_spad          = fd_spad_join( fd_spad_new( ctx->shared_spad_mem, shared_spad_max_alloc_footprint() ) );
 
   /* Allocate the write buffers */
   ctx->alloc = fd_alloc_join( fd_alloc_new( alloc_mem, FD_SHREDCAP_ALLOC_TAG ), fd_tile_idx() );
@@ -580,6 +821,7 @@ unprivileged_init( fd_topo_t *      topo,
 #define STEM_CALLBACK_CONTEXT_TYPE  fd_capture_tile_ctx_t
 #define STEM_CALLBACK_CONTEXT_ALIGN alignof(fd_capture_tile_ctx_t)
 
+#define STEM_CALLBACK_AFTER_CREDIT after_credit
 #define STEM_CALLBACK_DURING_FRAG during_frag
 #define STEM_CALLBACK_AFTER_FRAG  after_frag
 #define STEM_CALLBACK_BEFORE_FRAG before_frag

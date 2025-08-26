@@ -1,9 +1,11 @@
 #ifndef HEADER_fd_src_flamenco_repair_fd_repair_h
 #define HEADER_fd_src_flamenco_repair_fd_repair_h
 
-#include "../gossip/fd_gossip.h"
+#include "../gossip/fd_gossip_types.h"
 #include "../../ballet/shred/fd_shred.h"
 #include "../../disco/metrics/generated/fd_metrics_repair.h"
+#include "../../disco/metrics/fd_metrics.h"
+#include "../types/fd_types.h"
 
 
 #define FD_REPAIR_DELIVER_FAIL_TIMEOUT -1
@@ -20,7 +22,7 @@
 #define FD_REPAIR_SCRATCH_DEPTH  (1UL << 11UL)
 
 /* Max number of validators that can be actively queried */
-#define FD_ACTIVE_KEY_MAX (1<<12)
+#define FD_ACTIVE_KEY_MAX (FD_CONTACT_INFO_TABLE_SIZE)
 /* Max number of pending shred requests */
 #define FD_NEEDED_KEY_MAX (1<<20)
 /* Max number of sticky repair peers */
@@ -32,9 +34,12 @@
 /* Sha256 pre-image size for pings */
 #define FD_PING_PRE_IMAGE_SZ (48UL)
 /* Number of peers to send requests to. */
-#define FD_REPAIR_NUM_NEEDED_PEERS (2)
+#define FD_REPAIR_NUM_NEEDED_PEERS (1)
+/* Max number of pending sign requests */
+#define FD_REPAIR_PENDING_SIGN_REQ_MAX (1<<10)
+/* Maximum size for sign buffer, typically <= 160 bytes (e.g., pings, repairs) */
+#define FD_REPAIR_MAX_SIGN_BUF_SIZE (256UL)
 
-typedef fd_gossip_peer_addr_t fd_repair_peer_addr_t;
 
 /* Hash a hash value */
 FD_FN_PURE static inline
@@ -45,22 +50,22 @@ ulong fd_hash_hash( const fd_hash_t * key, ulong seed ) {
 
 /* Test if two addresses are equal */
 FD_FN_PURE static inline int
-fd_repair_peer_addr_eq( const fd_repair_peer_addr_t * key1, const fd_repair_peer_addr_t * key2 ) {
-  FD_STATIC_ASSERT(sizeof(fd_repair_peer_addr_t) == sizeof(ulong),"messed up size");
+fd_repair_peer_addr_eq( const fd_ip4_port_t * key1, const fd_ip4_port_t * key2 ) {
+  FD_STATIC_ASSERT(sizeof(fd_ip4_port_t) == sizeof(ulong),"messed up size");
   return key1->l == key2->l;
 }
 
 /* Hash an address */
 FD_FN_PURE static inline ulong
-fd_repair_peer_addr_hash( const fd_repair_peer_addr_t * key, ulong seed ) {
-  FD_STATIC_ASSERT(sizeof(fd_repair_peer_addr_t) == sizeof(ulong),"messed up size");
+fd_repair_peer_addr_hash( const fd_ip4_port_t * key, ulong seed ) {
+  FD_STATIC_ASSERT(sizeof(fd_ip4_port_t) == sizeof(ulong),"messed up size");
   return (key->l + seed + 7242237688154252699UL)*9540121337UL;
 }
 
 /* Efficiently copy an address */
 static inline void
-fd_repair_peer_addr_copy( fd_repair_peer_addr_t * keyd, const fd_repair_peer_addr_t * keys ) {
-  FD_STATIC_ASSERT(sizeof(fd_repair_peer_addr_t) == sizeof(ulong),"messed up size");
+fd_repair_peer_addr_copy( fd_ip4_port_t * keyd, const fd_ip4_port_t * keys ) {
+  FD_STATIC_ASSERT(sizeof(fd_ip4_port_t) == sizeof(ulong),"messed up size");
   keyd->l = keys->l;
 }
 
@@ -72,7 +77,7 @@ struct fd_active_elem {
     fd_pubkey_t key;  /* Public identifier and map key */
     ulong next; /* used internally by fd_map_giant */
 
-    fd_repair_peer_addr_t addr;
+    fd_ip4_port_t addr;
     // Might be worth keeping these fields, but currently response rate is pretty high.
     // latency could be a useful metric to keep track of.
     ulong avg_reqs; /* Moving average of the number of requests */
@@ -149,7 +154,7 @@ fd_repair_nonce_copy( fd_repair_nonce_t * keyd, const fd_repair_nonce_t * keys )
 }
 
 struct fd_pinged_elem {
-  fd_repair_peer_addr_t key;
+  fd_ip4_port_t key;
   ulong next;
   fd_pubkey_t id;
   fd_hash_t token;
@@ -157,12 +162,34 @@ struct fd_pinged_elem {
 };
 typedef struct fd_pinged_elem fd_pinged_elem_t;
 #define MAP_NAME     fd_pinged_table
-#define MAP_KEY_T    fd_repair_peer_addr_t
+#define MAP_KEY_T    fd_ip4_port_t
 #define MAP_KEY_EQ   fd_repair_peer_addr_eq
 #define MAP_KEY_HASH fd_repair_peer_addr_hash
 #define MAP_KEY_COPY fd_repair_peer_addr_copy
 #define MAP_T        fd_pinged_elem_t
 #include "../../util/tmpl/fd_map_giant.c"
+
+/* Pending sign request structure for async request handling */
+struct fd_repair_pending_sign_req {
+  ulong       nonce;        /* map key, unique nonce */
+  ulong       next;         /* used internally by fd_map_chain */
+  uchar       buf[FD_REPAIR_MAX_SIGN_BUF_SIZE];
+  ulong       buflen;
+  ulong       sig_offset;
+  uint        dst_ip_addr;
+  ushort      dst_port;
+  fd_pubkey_t recipient;
+};
+typedef struct fd_repair_pending_sign_req fd_repair_pending_sign_req_t;
+
+#define POOL_NAME   fd_repair_pending_sign_req_pool
+#define POOL_T      fd_repair_pending_sign_req_t
+#include "../../util/tmpl/fd_pool.c"
+
+#define MAP_NAME     fd_repair_pending_sign_req_map
+#define MAP_KEY      nonce
+#define MAP_ELE_T    fd_repair_pending_sign_req_t
+#include "../../util/tmpl/fd_map_chain.c"
 
 struct fd_peer {
   fd_pubkey_t   key;
@@ -180,6 +207,8 @@ struct fd_repair_metrics {
   ulong recv_pkt_corrupted_msg;
   ulong send_pkt_cnt;
   ulong sent_pkt_types[FD_METRICS_ENUM_REPAIR_SENT_REQUEST_TYPES_CNT];
+  fd_histf_t store_link_wait[ 1 ];
+  fd_histf_t store_link_work[ 1 ];
 };
 typedef struct fd_repair_metrics fd_repair_metrics_t;
 #define FD_REPAIR_METRICS_FOOTPRINT ( sizeof( fd_repair_metrics_t ) )
@@ -191,8 +220,8 @@ struct fd_repair {
     fd_pubkey_t * public_key;
     uchar * private_key;
     /* My repair addresses */
-    fd_repair_peer_addr_t service_addr;
-    fd_repair_peer_addr_t intake_addr;
+    fd_ip4_port_t service_addr;
+    fd_ip4_port_t intake_addr;
     /* Function used to send raw packets on the network */
     void * fun_arg;
     /* Table of validators that we are actively pinging, keyed by repair address */
@@ -235,6 +264,9 @@ struct fd_repair {
     fd_vote_stake_weight_t * stake_weights_temp;
     /* Path to the file where we write the cache of known good repair peers, to make cold booting faster */
     int good_peer_cache_file_fd;
+    /* Pending sign requests for async operations */
+    fd_repair_pending_sign_req_t      * pending_sign_req_pool;
+    fd_repair_pending_sign_req_map_t  * pending_sign_req_map;
     /* Metrics */
     fd_repair_metrics_t metrics;
 };
@@ -246,13 +278,16 @@ fd_repair_align ( void ) { return 128UL; }
 FD_FN_CONST static inline ulong
 fd_repair_footprint( void ) {
   ulong l = FD_LAYOUT_INIT;
-  l = FD_LAYOUT_APPEND( l, alignof(fd_repair_t), sizeof(fd_repair_t) );
-  l = FD_LAYOUT_APPEND( l, fd_active_table_align(), fd_active_table_footprint(FD_ACTIVE_KEY_MAX) );
-  l = FD_LAYOUT_APPEND( l, fd_inflight_table_align(), fd_inflight_table_footprint(FD_NEEDED_KEY_MAX) );
-  l = FD_LAYOUT_APPEND( l, fd_pinged_table_align(), fd_pinged_table_footprint(FD_REPAIR_PINGED_MAX) );
+  l = FD_LAYOUT_APPEND( l, alignof(fd_repair_t),                    sizeof(fd_repair_t) );
+  l = FD_LAYOUT_APPEND( l, fd_active_table_align(),                 fd_active_table_footprint(FD_ACTIVE_KEY_MAX) );
+  l = FD_LAYOUT_APPEND( l, fd_inflight_table_align(),               fd_inflight_table_footprint(FD_NEEDED_KEY_MAX) );
+  l = FD_LAYOUT_APPEND( l, fd_pinged_table_align(),                 fd_pinged_table_footprint(FD_REPAIR_PINGED_MAX) );
   /* regular and temp stake weights */
-  l = FD_LAYOUT_APPEND( l, alignof(fd_vote_stake_weight_t), FD_STAKE_WEIGHTS_MAX * sizeof(fd_vote_stake_weight_t) );
-  l = FD_LAYOUT_APPEND( l, alignof(fd_vote_stake_weight_t), FD_STAKE_WEIGHTS_MAX * sizeof(fd_vote_stake_weight_t) );
+  l = FD_LAYOUT_APPEND( l, alignof(fd_vote_stake_weight_t),         FD_STAKE_WEIGHTS_MAX * sizeof(fd_vote_stake_weight_t) );
+  l = FD_LAYOUT_APPEND( l, alignof(fd_vote_stake_weight_t),         FD_STAKE_WEIGHTS_MAX * sizeof(fd_vote_stake_weight_t) );
+  /* pending sign request structures */
+  l = FD_LAYOUT_APPEND( l, fd_repair_pending_sign_req_pool_align(), fd_repair_pending_sign_req_pool_footprint( FD_REPAIR_PENDING_SIGN_REQ_MAX ) );
+  l = FD_LAYOUT_APPEND( l, fd_repair_pending_sign_req_map_align(),  fd_repair_pending_sign_req_map_footprint( FD_REPAIR_PENDING_SIGN_REQ_MAX ) );
   return FD_LAYOUT_FINI(l, fd_repair_align() );
 }
 
@@ -267,8 +302,8 @@ FD_FN_CONST ulong         fd_repair_footprint( void );
 struct fd_repair_config {
     fd_pubkey_t * public_key;
     uchar * private_key;
-    fd_repair_peer_addr_t service_addr;
-    fd_repair_peer_addr_t intake_addr;
+    fd_ip4_port_t service_addr;
+    fd_ip4_port_t intake_addr;
     int good_peer_cache_file_fd;
 };
 typedef struct fd_repair_config fd_repair_config_t;
@@ -277,10 +312,10 @@ typedef struct fd_repair_config fd_repair_config_t;
 int fd_repair_set_config( fd_repair_t * glob, const fd_repair_config_t * config );
 
 /* Update the binding addr */
-int fd_repair_update_addr( fd_repair_t * glob, const fd_repair_peer_addr_t * intake_addr, const fd_repair_peer_addr_t * service_addr );
+int fd_repair_update_addr( fd_repair_t * glob, const fd_ip4_port_t * intake_addr, const fd_ip4_port_t * service_addr );
 
 /* Add a peer to talk to */
-int fd_repair_add_active_peer( fd_repair_t * glob, fd_repair_peer_addr_t const * addr, fd_pubkey_t const * id );
+int fd_repair_add_active_peer( fd_repair_t * glob, fd_ip4_port_t const * addr, fd_pubkey_t const * id );
 
 /* Set the current protocol time inf nanosecs. Call this as often as feasible. */
 void fd_repair_settime( fd_repair_t * glob, long ts );
@@ -327,5 +362,24 @@ void fd_repair_set_stake_weights_fini( fd_repair_t * repair );
 fd_repair_metrics_t *
 fd_repair_get_metrics( fd_repair_t * repair );
 
+/* Pending sign request operations */
+fd_repair_pending_sign_req_t *
+fd_repair_insert_pending_request( fd_repair_t *            repair,
+                                   fd_repair_protocol_t *   protocol,
+                                   uint                     dst_ip_addr,
+                                   ushort                   dst_port,
+                                   enum fd_needed_elem_type type,
+                                   ulong                    slot,
+                                   uint                     shred_index,
+                                   long                     now,
+                                   fd_pubkey_t const *      recipient );
+
+fd_repair_pending_sign_req_t *
+fd_repair_query_pending_request( fd_repair_t * repair,
+                                 ulong         nonce );
+
+int
+fd_repair_remove_pending_request( fd_repair_t * repair,
+                                  ulong         nonce );
 
 #endif /* HEADER_fd_src_flamenco_repair_fd_repair_h */

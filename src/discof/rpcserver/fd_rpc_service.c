@@ -3,14 +3,13 @@
 #include "fd_webserver.h"
 #include "base_enc.h"
 #include "../../flamenco/types/fd_types.h"
-#include "../../flamenco/types/fd_solana_block.pb.h"
-#include "../../flamenco/runtime/fd_runtime.h"
 #include "../../flamenco/runtime/fd_acc_mgr.h"
-#include "../../flamenco/runtime/sysvar/fd_sysvar_rent.h"
-#include "../../flamenco/runtime/sysvar/fd_sysvar_epoch_schedule.h"
 #include "../../ballet/base58/fd_base58.h"
 #include "../../ballet/base64/fd_base64.h"
+#include "../../ballet/shred/fd_shred.h"
+#include "../reasm/fd_reasm.h"
 #include "fd_rpc_history.h"
+#include "fd_block_to_json.h"
 #include "keywords.h"
 #include <errno.h>
 #include <stdlib.h>
@@ -19,11 +18,45 @@
 #include <netinet/in.h>
 #include <stdarg.h>
 
+#ifdef __has_include
+#if __has_include("../../app/firedancer/version.h")
 #include "../../app/firedancer/version.h"
+#endif
+#endif
+
+#ifndef FDCTL_MAJOR_VERSION
+#define FDCTL_MAJOR_VERSION 0
+#endif
+#ifndef FDCTL_MINOR_VERSION
+#define FDCTL_MINOR_VERSION 0
+#endif
+#ifndef FDCTL_PATCH_VERSION
+#define FDCTL_PATCH_VERSION 0
+#endif
 
 #define CRLF "\r\n"
 #define MATCH_STRING(_text_,_text_sz_,_str_) (_text_sz_ == sizeof(_str_)-1 && memcmp(_text_, _str_, sizeof(_str_)-1) == 0)
 #define EMIT_SIMPLE(_str_) fd_web_reply_append(ws, _str_, sizeof(_str_)-1)
+
+/* If the 0th bit is set, this indicates the block is preparing, which
+   means it might be partially executed e.g. a subset of the microblocks
+   have been executed.  It is not safe to remove, relocate, or modify
+   the block in any way at this time.
+
+   Callers holding a pointer to a block should always make sure to
+   inspect this flag.
+
+   Other flags mainly provide useful metadata for read-only callers, eg.
+   RPC. */
+
+#define FD_BLOCK_FLAG_RECEIVING 0 /* xxxxxxx1 still receiving shreds */
+#define FD_BLOCK_FLAG_COMPLETED 1 /* xxxxxx1x received the block ie. all shreds (SLOT_COMPLETE) */
+#define FD_BLOCK_FLAG_REPLAYING 2 /* xxxxx1xx replay in progress (DO NOT REMOVE) */
+#define FD_BLOCK_FLAG_PROCESSED 3 /* xxxx1xxx successfully replayed the block */
+#define FD_BLOCK_FLAG_EQVOCSAFE 4 /* xxxx1xxx 52% of cluster has voted on this (slot, bank hash) */
+#define FD_BLOCK_FLAG_CONFIRMED 5 /* xxx1xxxx 2/3 of cluster has voted on this (slot, bank hash) */
+#define FD_BLOCK_FLAG_FINALIZED 6 /* xx1xxxxx 2/3 of cluster has rooted this slot */
+#define FD_BLOCK_FLAG_DEADBLOCK 7 /* x1xxxxxx failed to replay the block */
 
 static const uint PATH_COMMITMENT[4] = { ( JSON_TOKEN_LBRACE << 16 ) | KEYW_JSON_PARAMS,
                                          ( JSON_TOKEN_LBRACKET << 16 ) | 1,
@@ -66,8 +99,7 @@ struct fd_rpc_global_ctx {
   fd_spad_t * spad;
   fd_webserver_t ws;
   fd_funk_t * funk;
-  fd_blockstore_t blockstore[1];
-  int blockstore_fd;
+  fd_store_t * store;
   struct fd_ws_subscription sub_list[FD_WS_MAX_SUBS];
   ulong sub_cnt;
   ulong last_subsc_id;
@@ -77,8 +109,10 @@ struct fd_rpc_global_ctx {
   fd_perf_sample_t perf_sample_snapshot;
   long perf_sample_ts;
   fd_multi_epoch_leaders_t * leaders;
+  uchar buffer[sizeof(fd_reasm_fec_t) > sizeof(fd_replay_notif_msg_t) ? sizeof(fd_reasm_fec_t) : sizeof(fd_replay_notif_msg_t)];
   ulong acct_age;
   fd_rpc_history_t * history;
+  fd_pubkey_t const * identity_key; /* nullable */
 };
 typedef struct fd_rpc_global_ctx fd_rpc_global_ctx_t;
 
@@ -125,11 +159,11 @@ get_slot_from_commitment_level( struct json_values * values, fd_rpc_ctx_t * ctx 
   if( commit_str == NULL ) {
     return fd_rpc_history_latest_slot( ctx->global->history );
   } else if( MATCH_STRING( commit_str, commit_str_sz, "confirmed" ) ) {
-    return ctx->global->blockstore->shmem->hcs;
+    return 0;
   } else if( MATCH_STRING( commit_str, commit_str_sz, "processed" ) ) {
-    return ctx->global->blockstore->shmem->lps;
+    return 0;
   } else if( MATCH_STRING( commit_str, commit_str_sz, "finalized" ) ) {
-    return ctx->global->blockstore->shmem->wmk;
+    return 0;
   } else {
     fd_method_error( ctx, -1, "invalid commitment %s", (const char *)commit_str );
     return FD_SLOT_NULL;
@@ -445,10 +479,9 @@ method_getBlockProduction(struct json_values* values, fd_rpc_ctx_t * ctx) {
   (void)values;
   fd_rpc_global_ctx_t * glob = ctx->global;
   fd_webserver_t * ws = &glob->ws;
-  fd_blockstore_t * blockstore = glob->blockstore;
   FD_SPAD_FRAME_BEGIN( ctx->global->spad ) {
-    ulong startslot = blockstore->shmem->wmk;
-    ulong endslot = blockstore->shmem->lps;
+    ulong startslot = 0;
+    ulong endslot = 0;
 
     fd_multi_epoch_leaders_lsched_sorted_t lscheds = fd_multi_epoch_leaders_get_sorted_lscheds( glob->leaders );
 
@@ -771,6 +804,19 @@ method_getHighestSnapshotSlot(struct json_values* values, fd_rpc_ctx_t * ctx) {
   return 0;
 }
 
+// Implementation of the "getIdentity" method
+// curl http://localhost:8123 -X POST -H "Content-Type: application/json" -d ' {"jsonrpc":"2.0","id":1, "method":"getIdentity"} '
+static int
+method_getIdentity(struct json_values* values, fd_rpc_ctx_t * ctx) {
+  (void)values;
+  fd_webserver_t * ws = &ctx->global->ws;
+  if( !ctx->global->identity_key ) return 1; /* not supported */
+  fd_web_reply_sprintf(ws, "{\"jsonrpc\":\"2.0\",\"result\":{\"identity\":\"");
+  fd_web_reply_encode_base58(ws, ctx->global->identity_key, sizeof(fd_pubkey_t));
+  fd_web_reply_sprintf(ws, "\"},\"id\":%s}" CRLF, ctx->call_id);
+  return 0;
+}
+
 // Implementation of the "getInflationGovernor" methods
 static int
 method_getInflationGovernor(struct json_values* values, fd_rpc_ctx_t * ctx) {
@@ -946,10 +992,10 @@ method_getMaxRetransmitSlot(struct json_values* values, fd_rpc_ctx_t * ctx) {
 static int
 method_getMaxShredInsertSlot(struct json_values* values, fd_rpc_ctx_t * ctx) {
   (void) values;
-  fd_blockstore_t * blockstore = ctx->global->blockstore;
+  ulong slot = 0;
   fd_webserver_t * ws = &ctx->global->ws;
   fd_web_reply_sprintf(ws, "{\"jsonrpc\":\"2.0\",\"result\":%lu,\"id\":%s}" CRLF,
-                       blockstore->shmem->wmk, ctx->call_id); /* FIXME archival file */
+                       slot, ctx->call_id); /* FIXME archival file */
   return 0;
 }
 
@@ -1532,6 +1578,8 @@ method_getVoteAccounts(struct json_values* values, fd_rpc_ctx_t * ctx) {
     const void* arg = json_get_value(values, path, 4, &arg_sz);
     (void)arg; // Ignore for now
 
+
+    /* TODO: Integrate properly. Maybe snoop link out of replay? */
     // ulong                 slot      = get_slot_from_commitment_level( values, ctx );
     // fd_slot_bank_t *      slot_bank = read_slot_bank( ctx, slot );
     // if( FD_UNLIKELY( !slot_bank ) ) {
@@ -1539,74 +1587,74 @@ method_getVoteAccounts(struct json_values* values, fd_rpc_ctx_t * ctx) {
     //   return 0;
     // }
 
-    int needcomma = 0;
+    // int needcomma = 0;
 
-    fd_clock_timestamp_vote_t_mapnode_t * timestamp_votes_root = NULL;
-    fd_clock_timestamp_vote_t_mapnode_t * timestamp_votes_pool = NULL;
-    fd_vote_accounts_pair_t_mapnode_t *   vote_acc_root        = NULL; // slot_bank->epoch_stakes.vote_accounts_root;
-    fd_vote_accounts_pair_t_mapnode_t *   vote_acc_pool        = NULL; // slot_bank->epoch_stakes.vote_accounts_pool;
-    for( fd_vote_accounts_pair_t_mapnode_t* n = fd_vote_accounts_pair_t_map_minimum(vote_acc_pool, vote_acc_root);
-         n;
-         n = fd_vote_accounts_pair_t_map_successor( vote_acc_pool, n ) ) {
+    // fd_clock_timestamp_vote_t_mapnode_t * timestamp_votes_root = NULL;
+    // fd_clock_timestamp_vote_t_mapnode_t * timestamp_votes_pool = NULL;
+    // fd_vote_accounts_pair_t_mapnode_t *   vote_acc_root        = NULL; // slot_bank->epoch_stakes.vote_accounts_root;
+    // fd_vote_accounts_pair_t_mapnode_t *   vote_acc_pool        = NULL; // slot_bank->epoch_stakes.vote_accounts_pool;
+    // for( fd_vote_accounts_pair_t_mapnode_t* n = fd_vote_accounts_pair_t_map_minimum(vote_acc_pool, vote_acc_root);
+    //      n;
+    //      n = fd_vote_accounts_pair_t_map_successor( vote_acc_pool, n ) ) {
 
-      /* get timestamp */
-      fd_pubkey_t const * vote_pubkey = &n->elem.key;
+    //   /* get timestamp */
+    //   fd_pubkey_t const * vote_pubkey = &n->elem.key;
 
-      if( timestamp_votes_pool == NULL ) {
-        continue;
-      } else {
-        fd_clock_timestamp_vote_t_mapnode_t query_vote_acc_node;
-        query_vote_acc_node.elem.pubkey = *vote_pubkey;
-        fd_clock_timestamp_vote_t_mapnode_t * vote_acc_node = fd_clock_timestamp_vote_t_map_find(timestamp_votes_pool, timestamp_votes_root, &query_vote_acc_node);
-        ulong vote_timestamp = 0;
-        ulong vote_slot = 0;
-        if( vote_acc_node == NULL ) {
-          int err;
-          fd_vote_state_versioned_t * vsv = fd_bincode_decode_spad(
-            vote_state_versioned, ctx->global->spad,
-            n->elem.value.data,
-            n->elem.value.data_len,
-            &err );
-          if( FD_UNLIKELY( err!=FD_BINCODE_SUCCESS ) ) {
-            FD_LOG_WARNING(( "Vote state versioned decode failed" ));
-            continue;
-          }
+    //   if( timestamp_votes_pool == NULL ) {
+    //     continue;
+    //   } else {
+    //     fd_clock_timestamp_vote_t_mapnode_t query_vote_acc_node;
+    //     query_vote_acc_node.elem.pubkey = *vote_pubkey;
+    //     fd_clock_timestamp_vote_t_mapnode_t * vote_acc_node = fd_clock_timestamp_vote_t_map_find(timestamp_votes_pool, timestamp_votes_root, &query_vote_acc_node);
+    //     ulong vote_timestamp = 0;
+    //     ulong vote_slot = 0;
+    //     if( vote_acc_node == NULL ) {
+    //       int err;
+    //       fd_vote_state_versioned_t * vsv = fd_bincode_decode_spad(
+    //         vote_state_versioned, ctx->global->spad,
+    //         n->elem.value.data,
+    //         n->elem.value.data_len,
+    //         &err );
+    //       if( FD_UNLIKELY( err!=FD_BINCODE_SUCCESS ) ) {
+    //         FD_LOG_WARNING(( "Vote state versioned decode failed" ));
+    //         continue;
+    //       }
 
-          switch( vsv->discriminant ) {
-          case fd_vote_state_versioned_enum_v0_23_5:
-            vote_timestamp = (ulong)vsv->inner.v0_23_5.last_timestamp.timestamp;
-            vote_slot = vsv->inner.v0_23_5.last_timestamp.slot;
-            break;
-          case fd_vote_state_versioned_enum_v1_14_11:
-            vote_timestamp = (ulong)vsv->inner.v1_14_11.last_timestamp.timestamp;
-            vote_slot = vsv->inner.v1_14_11.last_timestamp.slot;
-            break;
-          case fd_vote_state_versioned_enum_current:
-            vote_timestamp = (ulong)vsv->inner.current.last_timestamp.timestamp;
-            vote_slot = vsv->inner.current.last_timestamp.slot;
-            break;
-          default:
-            __builtin_unreachable();
-          }
+    //       switch( vsv->discriminant ) {
+    //       case fd_vote_state_versioned_enum_v0_23_5:
+    //         vote_timestamp = (ulong)vsv->inner.v0_23_5.last_timestamp.timestamp;
+    //         vote_slot = vsv->inner.v0_23_5.last_timestamp.slot;
+    //         break;
+    //       case fd_vote_state_versioned_enum_v1_14_11:
+    //         vote_timestamp = (ulong)vsv->inner.v1_14_11.last_timestamp.timestamp;
+    //         vote_slot = vsv->inner.v1_14_11.last_timestamp.slot;
+    //         break;
+    //       case fd_vote_state_versioned_enum_current:
+    //         vote_timestamp = (ulong)vsv->inner.current.last_timestamp.timestamp;
+    //         vote_slot = vsv->inner.current.last_timestamp.slot;
+    //         break;
+    //       default:
+    //         __builtin_unreachable();
+    //       }
 
-        } else {
-          vote_timestamp = (ulong)vote_acc_node->elem.timestamp;
-          vote_slot = vote_acc_node->elem.slot;
-        }
-        (void)vote_timestamp;
+    //     } else {
+    //       vote_timestamp = (ulong)vote_acc_node->elem.timestamp;
+    //       vote_slot = vote_acc_node->elem.slot;
+    //     }
+    //     (void)vote_timestamp;
 
-        char pubkey[50];
-        fd_base58_encode_32(vote_pubkey->uc, 0, pubkey);
-        char key[50];
-        fd_base58_encode_32(n->elem.key.uc, 0, key);
-        if( needcomma ) fd_web_reply_sprintf(ws, ",");
-        fd_web_reply_sprintf(ws, "{\"commission\":0,\"epochVoteAccount\":true,\"epochCredits\":[],\"nodePubkey\":\"%s\",\"lastVote\":%lu,\"activatedStake\":%lu,\"votePubkey\":\"%s\",\"rootSlot\":0}",
-                             pubkey, vote_slot, n->elem.stake, key);
-        needcomma = 1;
-      }
-    }
+    //     char pubkey[50];
+    //     fd_base58_encode_32(vote_pubkey->uc, 0, pubkey);
+    //     char key[50];
+    //     fd_base58_encode_32(n->elem.key.uc, 0, key);
+    //     if( needcomma ) fd_web_reply_sprintf(ws, ",");
+    //     fd_web_reply_sprintf(ws, "{\"commission\":0,\"epochVoteAccount\":true,\"epochCredits\":[],\"nodePubkey\":\"%s\",\"lastVote\":%lu,\"activatedStake\":%lu,\"votePubkey\":\"%s\",\"rootSlot\":0}",
+    //                          pubkey, vote_slot, n->elem.stake, key);
+    //     needcomma = 1;
+    //   }
+    // }
 
-    fd_web_reply_sprintf(ws, "]},\"id\":%s}" CRLF, ctx->call_id);
+    // fd_web_reply_sprintf(ws, "]},\"id\":%s}" CRLF, ctx->call_id);
   } FD_SPAD_FRAME_END;
   return 0;
 }
@@ -1648,10 +1696,10 @@ method_isBlockhashValid(struct json_values* values, fd_rpc_ctx_t * ctx) {
 static int
 method_minimumLedgerSlot(struct json_values* values, fd_rpc_ctx_t * ctx) {
   (void) values;
-  fd_rpc_global_ctx_t * glob = ctx->global;
   fd_webserver_t * ws = &ctx->global->ws;
+  ulong slot = 0;
   fd_web_reply_sprintf(ws, "{\"jsonrpc\":\"2.0\",\"result\":%lu,\"id\":%s}" CRLF,
-                       glob->blockstore->shmem->wmk, ctx->call_id); /* FIXME archival file */
+                       slot, ctx->call_id); /* FIXME archival file */
   return 0;
 }
 
@@ -1879,6 +1927,10 @@ fd_webserver_method_generic(struct json_values* values, void * cb_arg) {
     break;
   case KEYW_RPCMETHOD_GETHIGHESTSNAPSHOTSLOT:
     if (!method_getHighestSnapshotSlot(values, &ctx))
+      return;
+    break;
+  case KEYW_RPCMETHOD_GETIDENTITY:
+    if (!method_getIdentity(values, &ctx))
       return;
     break;
   case KEYW_RPCMETHOD_GETINFLATIONGOVERNOR:
@@ -2260,15 +2312,16 @@ fd_webserver_ws_subscribe(struct json_values* values, ulong conn_id, void * cb_a
 
 void
 fd_rpc_create_ctx(fd_rpcserver_args_t * args, fd_rpc_ctx_t ** ctx_p) {
-  fd_valloc_t valloc = fd_spad_virtual( args->spad );
-  fd_rpc_ctx_t * ctx         = (fd_rpc_ctx_t *)fd_valloc_malloc(valloc, alignof(fd_rpc_ctx_t), sizeof(fd_rpc_ctx_t));
-  fd_rpc_global_ctx_t * gctx = (fd_rpc_global_ctx_t *)fd_valloc_malloc(valloc, alignof(fd_rpc_global_ctx_t), sizeof(fd_rpc_global_ctx_t));
+  fd_rpc_ctx_t * ctx         = (fd_rpc_ctx_t *)fd_spad_alloc( args->spad, alignof(fd_rpc_ctx_t), sizeof(fd_rpc_ctx_t) );
+  fd_rpc_global_ctx_t * gctx = (fd_rpc_global_ctx_t *)fd_spad_alloc( args->spad, alignof(fd_rpc_global_ctx_t), sizeof(fd_rpc_global_ctx_t) );
   fd_memset(ctx, 0, sizeof(fd_rpc_ctx_t));
   fd_memset(gctx, 0, sizeof(fd_rpc_global_ctx_t));
 
   ctx->global   = gctx;
   gctx->spad    = args->spad;
-  gctx->leaders = args->leaders;
+
+  uchar * mleaders_mem = (uchar *)fd_spad_alloc( args->spad, FD_MULTI_EPOCH_LEADERS_ALIGN, FD_MULTI_EPOCH_LEADERS_FOOTPRINT );
+  gctx->leaders = fd_multi_epoch_leaders_join( fd_multi_epoch_leaders_new( mleaders_mem) );
 
   if( !args->offline ) {
     gctx->tpu_socket = socket(AF_INET, SOCK_DGRAM, 0);
@@ -2287,11 +2340,12 @@ fd_rpc_create_ctx(fd_rpcserver_args_t * args, fd_rpc_ctx_t ** ctx_p) {
     gctx->tpu_socket = -1;
   }
 
-  void * mem = fd_valloc_malloc( valloc, fd_perf_sample_deque_align(), fd_perf_sample_deque_footprint() );
+  void * mem = fd_spad_alloc( args->spad, fd_perf_sample_deque_align(), fd_perf_sample_deque_footprint() );
   gctx->perf_samples = fd_perf_sample_deque_join( fd_perf_sample_deque_new( mem ) );
   FD_TEST( gctx->perf_samples );
 
   gctx->history = fd_rpc_history_create(args);
+  gctx->identity_key = args->identity_key;
 
   FD_LOG_NOTICE(( "starting web server on port %u", (uint)args->port ));
   if (fd_webserver_start(args->port, args->params, gctx->spad, &gctx->ws, ctx))
@@ -2303,10 +2357,8 @@ fd_rpc_create_ctx(fd_rpcserver_args_t * args, fd_rpc_ctx_t ** ctx_p) {
 void
 fd_rpc_start_service(fd_rpcserver_args_t * args, fd_rpc_ctx_t * ctx) {
   fd_rpc_global_ctx_t * gctx = ctx->global;
-
   gctx->funk = args->funk;
-  memcpy( gctx->blockstore, args->blockstore, sizeof(fd_blockstore_t) );
-  gctx->blockstore_fd = args->blockstore_fd;
+  gctx->store = args->store;
 }
 
 int
@@ -2332,15 +2384,15 @@ fd_webserver_ws_closed(ulong conn_id, void * cb_arg) {
 }
 
 void
-fd_rpc_replay_during_frag( fd_rpc_ctx_t * ctx, fd_replay_notif_msg_t * state, void const * msg, int sz ) {
-  (void)ctx;
+fd_rpc_replay_during_frag( fd_rpc_ctx_t * ctx, void const * msg, int sz ) {
   FD_TEST( sz == (int)sizeof(fd_replay_notif_msg_t) );
-  fd_memcpy(state, msg, sizeof(fd_replay_notif_msg_t));
+  fd_memcpy(ctx->global->buffer, msg, sizeof(fd_replay_notif_msg_t));
 }
 
 void
-fd_rpc_replay_after_frag(fd_rpc_ctx_t * ctx, fd_replay_notif_msg_t * msg) {
+fd_rpc_replay_after_frag(fd_rpc_ctx_t * ctx) {
   fd_rpc_global_ctx_t * subs = ctx->global;
+  fd_replay_notif_msg_t * msg = (fd_replay_notif_msg_t *)subs->buffer;
 
   if( msg->type == FD_REPLAY_SLOT_TYPE ) {
     long ts = fd_log_wallclock() / (long)1e9;
@@ -2376,7 +2428,7 @@ fd_rpc_replay_after_frag(fd_rpc_ctx_t * ctx, fd_replay_notif_msg_t * msg) {
 
     if( msg->slot_exec.shred_cnt == 0 ) return;
 
-    fd_rpc_history_save( subs->history, subs->blockstore, msg );
+    fd_rpc_history_save_info( subs->history, msg );
 
     for( ulong j = 0; j < subs->sub_cnt; ++j ) {
       struct fd_ws_subscription * sub = &subs->sub_list[ j ];
@@ -2393,13 +2445,25 @@ fd_rpc_replay_after_frag(fd_rpc_ctx_t * ctx, fd_replay_notif_msg_t * msg) {
 }
 
 void
-fd_rpc_stake_during_frag( fd_rpc_ctx_t * ctx, fd_multi_epoch_leaders_t * state, void const * msg, int sz ) {
-  (void)ctx; (void)sz;
-  fd_multi_epoch_leaders_stake_msg_init( state, msg );
+fd_rpc_stake_during_frag( fd_rpc_ctx_t * ctx, void const * msg, int sz ) {
+  (void)sz;
+  fd_multi_epoch_leaders_stake_msg_init( ctx->global->leaders, msg );
 }
 
 void
-fd_rpc_stake_after_frag(fd_rpc_ctx_t * ctx, fd_multi_epoch_leaders_t * state) {
-  (void)ctx;
-  fd_multi_epoch_leaders_stake_msg_fini( state );
+fd_rpc_stake_after_frag(fd_rpc_ctx_t * ctx) {
+  fd_multi_epoch_leaders_stake_msg_fini( ctx->global->leaders );
+}
+
+void
+fd_rpc_repair_during_frag(fd_rpc_ctx_t * ctx, void const * msg, int sz) {
+  FD_TEST( sz==(int)sizeof(fd_reasm_fec_t) );
+  fd_memcpy(ctx->global->buffer, msg, sizeof(fd_reasm_fec_t));
+}
+
+void
+fd_rpc_repair_after_frag(fd_rpc_ctx_t * ctx) {
+  fd_rpc_global_ctx_t * subs = ctx->global;
+  fd_reasm_fec_t * fec_p = (fd_reasm_fec_t *)subs->buffer;
+  fd_rpc_history_save_fec( subs->history, subs->store, fec_p );
 }

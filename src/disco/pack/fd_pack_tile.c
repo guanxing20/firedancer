@@ -451,6 +451,9 @@ insert_from_extra( fd_pack_ctx_t * ctx ) {
   fd_memcpy( TXN(spot->txnp),     insert_txn,            fd_txn_footprint( insert_txn->instr_cnt, insert_txn->addr_table_lookup_cnt ) );
   fd_memcpy( spot->alt_accts,     insert->alt_accts,     insert_txn->addr_table_adtl_cnt*sizeof(fd_acct_addr_t)                       );
   spot->txnp->payload_sz = insert->txnp->payload_sz;
+  spot->txnp->source_tpu  = insert->txnp->source_tpu;
+  spot->txnp->source_ipv4 = insert->txnp->source_ipv4;
+  spot->txnp->scheduler_arrival_time_nanos = insert->txnp->scheduler_arrival_time_nanos;
   extra_txn_deq_remove_head( ctx->extra_txn_deq );
 
   ulong blockhash_slot = insert->txnp->blockhash_slot;
@@ -616,7 +619,10 @@ after_credit( fd_pack_ctx_t *     ctx,
         ctx->crank->metrics[ 0 ]++; /* BUNDLE_CRANK_STATUS_NOT_NEEDED */
       }
       else if( FD_LIKELY( txn_sz<ULONG_MAX ) ) {
-        bundle[0]->txnp->payload_sz = (ushort)txn_sz;
+        bundle[0]->txnp->payload_sz  = (ushort)txn_sz;
+        bundle[0]->txnp->source_tpu  = FD_TXN_M_TPU_SOURCE_BUNDLE;
+        bundle[0]->txnp->source_ipv4 = 0; /* not applicable */
+        bundle[0]->txnp->scheduler_arrival_time_nanos = ctx->approx_wallclock_ns + (long)((double)(fd_tickcount() - ctx->approx_tickcount) / ctx->ticks_per_ns);
         memcpy( bundle[0]->txnp->payload+TXN(bundle[0]->txnp)->recent_blockhash_off, ctx->crank->recent_blockhash, 32UL );
 
         fd_keyguard_client_sign( ctx->crank->keyguard_client, bundle[0]->txnp->payload+1UL,
@@ -818,8 +824,10 @@ during_frag( fd_pack_ctx_t * ctx,
       FD_LOG_ERR(( "chunk %lu %lu corrupt, not in range [%lu,%lu]", chunk, sz, ctx->in[ in_idx ].chunk0, ctx->in[ in_idx ].wmark ));
 
     fd_txn_m_t * txnm = (fd_txn_m_t *)dcache_entry;
-    ulong payload_sz = txnm->payload_sz;
-    ulong txn_t_sz   = txnm->txn_t_sz;
+    ulong payload_sz  = txnm->payload_sz;
+    ulong txn_t_sz    = txnm->txn_t_sz;
+    uint  source_ipv4 = txnm->source_ipv4;
+    uchar source_tpu  = txnm->source_tpu;
     FD_TEST( payload_sz<=FD_TPU_MTU    );
     FD_TEST( txn_t_sz  <=FD_TXN_MAX_SZ );
     fd_txn_t * txn  = fd_txn_m_txn_t( txnm );
@@ -898,8 +906,10 @@ during_frag( fd_pack_ctx_t * ctx,
     fd_memcpy( ctx->cur_spot->txnp->payload, fd_txn_m_payload( txnm ), payload_sz    );
     fd_memcpy( TXN(ctx->cur_spot->txnp),     txn,                      txn_t_sz      );
     fd_memcpy( ctx->cur_spot->alt_accts,     fd_txn_m_alut( txnm ),    addr_table_sz );
-    ctx->cur_spot->txnp->payload_sz = payload_sz;
     ctx->cur_spot->txnp->scheduler_arrival_time_nanos = ctx->approx_wallclock_ns + (long)((double)(fd_tickcount() - ctx->approx_tickcount) / ctx->ticks_per_ns);
+    ctx->cur_spot->txnp->payload_sz  = payload_sz;
+    ctx->cur_spot->txnp->source_ipv4 = source_ipv4;
+    ctx->cur_spot->txnp->source_tpu  = source_tpu;
 
     break;
   }
@@ -1178,7 +1188,8 @@ unprivileged_init( fd_topo_t *      topo,
             sign_out->mcache,
             sign_out->dcache,
             sign_in->mcache,
-            sign_in->dcache ) ) ) ) {
+            sign_in->dcache,
+            sign_out->mtu ) ) ) ) {
       FD_LOG_ERR(( "failed to construct keyguard" ));
     }
     /* Initialize enough of the prev config that it produces a

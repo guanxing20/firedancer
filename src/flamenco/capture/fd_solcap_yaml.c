@@ -1,10 +1,9 @@
-#include "../fd_flamenco.h"
 #include "fd_solcap_proto.h"
 #include "fd_solcap_reader.h"
 #include "fd_solcap.pb.h"
 #include "../runtime/fd_executor_err.h"
+#include "../../ballet/base64/fd_base64.h"
 #include "../../ballet/nanopb/pb_decode.h"
-#include "../../util/textstream/fd_textstream.h"
 #include <errno.h>
 #include <stdio.h>
 
@@ -94,13 +93,11 @@ process_account( FILE * file,
     "      owner:      '%s'\n"
     "      lamports:   %lu\n"
     "      slot:       %lu\n"
-    "      rent_epoch: %lu\n"
     "      executable: %s\n"
     "      data_sz:    %lu\n",
     FD_BASE58_ENC_32_ALLOCA( meta->owner ),
     meta->lamports,
     meta->slot,
-    meta->rent_epoch,
     meta->executable ? "true" : "false",
     meta->data_sz );
 
@@ -120,7 +117,6 @@ process_account( FILE * file,
        allows padding in the middle, but it's cleaner to only have
        padding at the end of the message. */
 #   define PART_RAW_SZ (720UL)
-#   define PART_BLK_SZ (4UL*(PART_RAW_SZ+2UL)/3UL)  /* see fd_textstream_encode_base64 */
     ulong data_sz = meta->data_sz;
     while( data_sz>0UL ) {
       ulong n = fd_ulong_min( data_sz, PART_RAW_SZ );
@@ -131,25 +127,13 @@ process_account( FILE * file,
         FD_LOG_ERR(( "fread account data failed (%d-%s)", errno, strerror( errno ) ));
 
       /* Encode chunk */
-      fd_valloc_t valloc = fd_scratch_virtual();
-      fd_scratch_push();
-
-      fd_textstream_t  _data_out[1];
-      fd_textstream_t * data_out = fd_textstream_new( _data_out, valloc, PART_BLK_SZ );
-      fd_textstream_encode_base64( data_out, buf, n );
-
-      /* Get pointer to encoded chunk */
-      FD_TEST( 1UL==fd_textstream_get_iov_count( data_out ) );
-      struct fd_iovec iov[1];
-      FD_TEST( 0  ==fd_textstream_get_iov( data_out, iov ) );
-
+      char  chunk[ FD_BASE64_ENC_SZ( PART_RAW_SZ ) ];
+      ulong chunk_sz = fd_base64_encode( chunk, buf, n );
       /* Print encoded chunk */
-      FD_TEST( 1UL==fwrite( iov[0].iov_base, iov[0].iov_len, 1UL, stdout ) );
+      FD_TEST( 1UL==fwrite( chunk, chunk_sz, 1UL, stdout ) );
 
       /* Wind up for next iteration */
       data_sz -= n;
-      fd_textstream_destroy( data_out );  /* technically noop */
-      fd_scratch_pop();
     }
 #   undef PART_RAW_SZ
 #   undef PART_BLK_SZ
@@ -176,7 +160,8 @@ process_account( FILE * file,
 static int
 process_account_table( FILE * file,
                        ulong  slot,
-                       int    verbose ) {
+                       int    verbose,
+                       int    show_duplicate_accounts ) {
 
   /* Remember stream cursor */
 
@@ -245,15 +230,40 @@ process_account_table( FILE * file,
     return 0;
   }
 
-  /* Read accounts table */
+  typedef struct {
+    fd_solcap_account_tbl_t entry;
+    long acc_coff;
+    int is_last_occurrence;
+  } account_entry_info_t;
+
+  account_entry_info_t * entries = malloc(meta->account_table_cnt * sizeof(account_entry_info_t));
+  if( FD_UNLIKELY( !entries ) ) {
+    FD_LOG_ERR(( "malloc failed for account entries" ));
+    return 0;
+  }
 
   for( ulong i=0UL; i < meta->account_table_cnt; i++ ) {
-    /* Read account */
-
-    fd_solcap_account_tbl_t entry[1];
-    if( FD_UNLIKELY( 1UL!=fread( entry, sizeof(fd_solcap_account_tbl_t), 1UL, file ) ) ) {
+    if( FD_UNLIKELY( 1UL!=fread( &entries[i].entry, sizeof(fd_solcap_account_tbl_t), 1UL, file ) ) ) {
       FD_LOG_ERR(( "fread accounts table entry failed (%d-%s)", errno, strerror( errno ) ));
+      free(entries);
       return 0;
+    }
+    entries[i].acc_coff = entries[i].entry.acc_coff;
+    entries[i].is_last_occurrence = 1;
+  }
+
+  for( ulong i=0UL; i < meta->account_table_cnt; i++ ) {
+    for( ulong j=i+1UL; j < meta->account_table_cnt; j++ ) {
+      if( memcmp(entries[i].entry.key, entries[j].entry.key, sizeof(entries[i].entry.key)) == 0 ) {
+        entries[i].is_last_occurrence = 0;
+        break;
+      }
+    }
+  }
+
+  for( ulong i=0UL; i < meta->account_table_cnt; i++ ) {
+    if( !entries[i].is_last_occurrence && !show_duplicate_accounts ) {
+      continue;
     }
 
     /* Write to YAML */
@@ -262,22 +272,25 @@ process_account_table( FILE * file,
       "    - pubkey:   '%s'\n"
       "      hash:     '%s'\n"
       "      explorer: 'https://explorer.solana.com/block/%lu?accountFilter=%s&filter=all'\n",
-      FD_BASE58_ENC_32_ALLOCA( entry->key ),
-      FD_BASE58_ENC_32_ALLOCA( entry->hash ),
+      FD_BASE58_ENC_32_ALLOCA( entries[i].entry.key ),
+      FD_BASE58_ENC_32_ALLOCA( entries[i].entry.hash ),
       slot,
-      FD_BASE58_ENC_32_ALLOCA( entry->key ) );
+      FD_BASE58_ENC_32_ALLOCA( entries[i].entry.key ) );
 
     /* Fetch account details */
 
     if( verbose > 3 ) {
-      long acc_goff = (long)pos + entry->acc_coff;
+      long acc_goff = (long)pos + entries[i].acc_coff;
       if( FD_UNLIKELY( !process_account( file, acc_goff, verbose ) ) ) {
         FD_LOG_ERR(( "process_account() failed" ));
+        free(entries);
         return 0;
       }
     }
 
   } /* end for */
+
+  free(entries);
 
   /* Restore cursor */
 
@@ -297,6 +310,7 @@ static int
 process_bank( fd_solcap_chunk_t const * chunk,
               FILE *                    file,
               int                       verbose,
+              int                       show_duplicate_accounts,
               long                      chunk_gaddr,
               ulong                     start_slot,
               ulong                     end_slot,
@@ -372,7 +386,7 @@ process_bank( fd_solcap_chunk_t const * chunk,
     }
 
     printf( "  - accounts_delta:\n" );
-    if( FD_UNLIKELY( 0!=process_account_table( file, meta.slot, verbose ) ) )
+    if( FD_UNLIKELY( 0!=process_account_table( file, meta.slot, verbose, show_duplicate_accounts ) ) )
       return errno;
   }
 
@@ -475,35 +489,16 @@ main( int     argc,
   for( int i=1; i<argc; i++ )
     if( 0==strcmp( argv[i], "--help" ) ) return usage();
 
-  char const * _page_sz   = fd_env_strip_cmdline_cstr ( &argc, &argv, "--page-sz",    NULL, "gigantic" );
-  ulong        page_cnt   = fd_env_strip_cmdline_ulong( &argc, &argv, "--page-cnt",   NULL, 2UL        );
-  ulong        scratch_mb = fd_env_strip_cmdline_ulong( &argc, &argv, "--scratch-mb", NULL, 1024UL     );
-  int          verbose    = fd_env_strip_cmdline_int  ( &argc, &argv, "-v",           NULL, 0          );
-  ulong        start_slot = fd_env_strip_cmdline_ulong( &argc, &argv, "--start-slot", NULL, 0          );
-  ulong        end_slot   = fd_env_strip_cmdline_ulong( &argc, &argv, "--end-slot",   NULL, ULONG_MAX  );
-
-  ulong page_sz = fd_cstr_to_shmem_page_sz( _page_sz );
-  if( FD_UNLIKELY( !page_sz ) ) FD_LOG_ERR(( "unsupported --page-sz" ));
+  int   verbose                 = fd_env_strip_cmdline_int     ( &argc, &argv, "-v",           NULL, 0         );
+  int   show_duplicate_accounts = fd_env_strip_cmdline_contains( &argc, &argv, "--show-duplicate-accounts"     );
+  ulong start_slot              = fd_env_strip_cmdline_ulong   ( &argc, &argv, "--start-slot", NULL, 0         );
+  ulong end_slot                = fd_env_strip_cmdline_ulong   ( &argc, &argv, "--end-slot",   NULL, ULONG_MAX );
 
   if( argc!=2 ) {
     fprintf( stderr, "ERROR: expected 1 argument, got %d\n", argc-1 );
     usage();
     return 1;
   }
-
-  /* Create workspace and scratch allocator */
-
-  fd_wksp_t * wksp = fd_wksp_new_anonymous( page_sz, page_cnt, fd_log_cpu_id(), "wksp", 0UL );
-  if( FD_UNLIKELY( !wksp ) ) FD_LOG_ERR(( "fd_wksp_new_anonymous() failed" ));
-
-  ulong  smax = scratch_mb << 20;
-  void * smem = fd_wksp_alloc_laddr( wksp, fd_scratch_smem_align(), smax, 1UL );
-  if( FD_UNLIKELY( !smem ) ) FD_LOG_ERR(( "Failed to alloc scratch mem" ));
-  ulong  scratch_depth = 4UL;
-  void * fmem = fd_wksp_alloc_laddr( wksp, fd_scratch_fmem_align(), fd_scratch_fmem_footprint( scratch_depth ), 2UL );
-  if( FD_UNLIKELY( !fmem ) ) FD_LOG_ERR(( "Failed to alloc scratch frames" ));
-
-  fd_scratch_attach( smem, fmem, smax, scratch_depth );
 
   /* Open file */
 
@@ -552,7 +547,7 @@ main( int     argc,
 
     /* TODO: figure out how to make solana.solcap yamls print slot */
     if( chunk->magic == FD_SOLCAP_V1_BANK_MAGIC )
-      process_bank( chunk, file, verbose, chunk_gaddr, start_slot, end_slot, previous_slot != 0 );
+      process_bank( chunk, file, verbose, show_duplicate_accounts, chunk_gaddr, start_slot, end_slot, previous_slot != 0 );
     else if ( chunk->magic == FD_SOLCAP_V1_TRXN_MAGIC )
       previous_slot = process_txn( chunk, file, verbose, chunk_gaddr, previous_slot, start_slot, end_slot );
   }
@@ -560,9 +555,6 @@ main( int     argc,
   /* Cleanup */
 
   FD_LOG_NOTICE(( "Done" ));
-  FD_TEST( fd_scratch_frame_used()==0UL );
-  fd_wksp_free_laddr( fd_scratch_detach( NULL ) );
-  fd_wksp_free_laddr( fmem                      );
   fclose( file );
   fd_halt();
   return 0;

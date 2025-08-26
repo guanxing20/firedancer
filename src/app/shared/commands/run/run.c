@@ -547,6 +547,7 @@ warn_unknown_files( config_t const * config,
     if( FD_UNLIKELY( !known_file ) ) FD_LOG_WARNING(( "unknown file `%s` found in `%s`", entry->d_name, mount_path ));
   }
 
+  if( FD_UNLIKELY( errno && errno!=ENOENT ) ) FD_LOG_ERR(( "error reading dir `%s` (%i-%s)", mount_path, errno, fd_io_strerror( errno ) ));
   if( FD_UNLIKELY( closedir( dir ) ) ) FD_LOG_ERR(( "error closing `%s` (%i-%s)", mount_path, errno, fd_io_strerror( errno ) ));
 }
 
@@ -641,8 +642,21 @@ initialize_stacks( config_t const * config ) {
     char path[ PATH_MAX ];
     FD_TEST( fd_cstr_printf_check( path, PATH_MAX, NULL, "%s/%s_stack_%s%lu", config->hugetlbfs.huge_page_mount_path, config->name, tile->name, tile->kind_id ) );
 
-    int result = unlink( path );
-    if( -1==result && errno!=ENOENT ) FD_LOG_ERR(( "unlink() failed when trying to create stack `%s` (%i-%s)", path, errno, fd_io_strerror( errno ) ));
+    struct stat st;
+    int result = stat( path, &st );
+
+    int update_existing;
+    if( FD_UNLIKELY( !result && config->is_live_cluster ) ) {
+      if( FD_UNLIKELY( -1==unlink( path ) && errno!=ENOENT ) ) FD_LOG_ERR(( "unlink() failed when trying to create stack workspace `%s` (%i-%s)", path, errno, fd_io_strerror( errno ) ));
+      update_existing = 0;
+    } else if( FD_UNLIKELY( !result ) ) {
+      /* See above note about zeroing out pages. */
+      update_existing = 1;
+    } else if( FD_LIKELY( result && errno==ENOENT ) ) {
+      update_existing = 0;
+    } else {
+      FD_LOG_ERR(( "stat failed when trying to create workspace `%s` (%i-%s)", path, errno, fd_io_strerror( errno ) ));
+    }
 
     /* TODO: Use a better CPU idx for the stack if tile is floating */
     ulong stack_cpu_idx = 0UL;
@@ -653,7 +667,12 @@ initialize_stacks( config_t const * config ) {
 
     ulong sub_page_cnt[ 1 ] = { 6 };
     ulong sub_cpu_idx [ 1 ] = { stack_cpu_idx };
-    int err = fd_shmem_create_multi( name, FD_SHMEM_HUGE_PAGE_SZ, 1, sub_page_cnt, sub_cpu_idx, S_IRUSR | S_IWUSR ); /* logs details */
+    int err;
+    if( FD_UNLIKELY( update_existing ) ) {
+      err = fd_shmem_update_multi( name, FD_SHMEM_HUGE_PAGE_SZ, 1, sub_page_cnt, sub_cpu_idx, S_IRUSR | S_IWUSR ); /* logs details */
+    } else {
+      err = fd_shmem_create_multi( name, FD_SHMEM_HUGE_PAGE_SZ, 1, sub_page_cnt, sub_cpu_idx, S_IRUSR | S_IWUSR ); /* logs details */
+    }
     if( FD_UNLIKELY( err && errno==ENOMEM ) ) {
       warn_unknown_files( config, 0UL );
 
@@ -716,7 +735,8 @@ fdctl_check_configure( config_t const * config ) {
 
 void
 run_firedancer_init( config_t * config,
-                     int        init_workspaces ) {
+                     int        init_workspaces,
+                     int        check_configure ) {
   struct stat st;
   int err = stat( config->paths.identity_key, &st );
   if( FD_UNLIKELY( -1==err && errno==ENOENT ) ) FD_LOG_ERR(( "[consensus.identity_path] key does not exist `%s`. You can generate an identity key at this path by running `fdctl keys new identity --config <toml>`", config->paths.identity_key ));
@@ -730,7 +750,10 @@ run_firedancer_init( config_t * config,
     }
   }
 
-  fdctl_check_configure( config );
+  /* FIXME: fdctl_check_configure unconditionally checks for network
+            stack prerequisites even if the command being run does not
+            require networking.  Hack around that here for now. */
+  if( check_configure ) fdctl_check_configure( config );
   if( FD_LIKELY( init_workspaces ) ) initialize_workspaces( config );
   initialize_stacks( config );
 }
@@ -797,7 +820,7 @@ run_firedancer( config_t * config,
   /* dump the topology we are using to the output log */
   fd_topo_print_log( 0, &config->topo );
 
-  run_firedancer_init( config, init_workspaces );
+  run_firedancer_init( config, init_workspaces, 1 );
 
 #if defined(__x86_64__) || defined(__aarch64__)
 
@@ -880,6 +903,11 @@ run_firedancer( config_t * config,
 void
 run_cmd_fn( args_t *   args FD_PARAM_UNUSED,
             config_t * config ) {
+  #define CHECK_PORT_NON_ZERO( field ) \
+    if( FD_UNLIKELY( config->field==0 ) ) { \
+      FD_LOG_ERR(( #field " is not set in your configuration file. Please set it to a non-zero value." )); \
+    }
+
   if( FD_UNLIKELY( !config->gossip.entrypoints_cnt && !config->development.bootstrap ) )
     FD_LOG_ERR(( "No entrypoints specified in configuration file under [gossip.entrypoints], but "
                  "at least one is needed to determine how to connect to the Solana cluster. If "
@@ -892,6 +920,15 @@ run_cmd_fn( args_t *   args FD_PARAM_UNUSED,
       FD_LOG_ERR(( "One of the entrypoints in your configuration file under [gossip.entrypoints] is "
                    "empty. Please remove the empty entrypoint or set it correctly. "));
   }
+
+  CHECK_PORT_NON_ZERO( gossip.port );
+  CHECK_PORT_NON_ZERO( tiles.quic.quic_transaction_listen_port );
+  CHECK_PORT_NON_ZERO( tiles.quic.regular_transaction_listen_port );
+  CHECK_PORT_NON_ZERO( tiles.shred.shred_listen_port );
+  CHECK_PORT_NON_ZERO( tiles.metric.prometheus_listen_port );
+  CHECK_PORT_NON_ZERO( tiles.gui.gui_listen_port );
+
+  #undef CHECK_PORT_NON_ZERO
 
   run_firedancer( config, -1, 1 );
 }

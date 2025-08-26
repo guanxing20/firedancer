@@ -1,6 +1,5 @@
 #include "fd_lthash.h"
-#include "../fd_ballet.h"
-#include "../hex/fd_hex.h"
+#include "test_lthash_adder.c"
 
 static ushort const lthash_hello[1024] = {
   0x8fea, 0x3d16, 0x86b3, 0x9282, 0x445e, 0xc591, 0x8de5, 0xb34b, 0x6e50, 0xc1f8, 0xb74e, 0x868a, 0x08e9, 0x62c5, 0x674a, 0x0f20,
@@ -136,6 +135,35 @@ static ushort const lthash_world[1024] = {
   0x8b70, 0x1be3, 0xa39d, 0xbf82, 0x6e04, 0x3bd2, 0xdf31, 0x0741, 0xaab8, 0xd398, 0x01f4, 0xdd3a, 0x2f9d, 0x2b55, 0x6811, 0x171f,
 };
 
+static void
+bench_lthash_seq( void ) {
+  FD_LOG_NOTICE(( "Benchmarking lthash sequential API (128 byte input)" ));
+  uchar out[ 2048 ] __attribute__((aligned(64)));
+
+  fd_blake3_t _sha[1];
+  fd_blake3_t * sha = fd_blake3_join( fd_blake3_new( _sha ) );
+  FD_TEST( sha );
+
+  /* warmup */
+  ulong iter_target = 1<<21UL;
+  ulong iter = iter_target>>7;
+  long dt = fd_log_wallclock();
+  for( ulong rem=iter; rem; rem-- ) fd_blake3_fini_2048( fd_blake3_append( fd_blake3_init( sha ), lthash_hello, 128UL ), out );
+  dt = fd_log_wallclock() - dt;
+
+  /* for real */
+  iter = iter_target;
+  dt = fd_log_wallclock();
+  for( ulong rem=iter; rem; rem-- ) fd_blake3_fini_2048( fd_blake3_append( fd_blake3_init( sha ), lthash_hello, 128UL ), out );
+  dt = fd_log_wallclock() - dt;
+
+  FD_LOG_NOTICE(( "~%.2e hash/s; %f ns per hash",
+                  (double)(((float)(iter))/((float)dt*1e-9f)),
+                  (double)dt/(double)iter ));
+
+  fd_blake3_delete( fd_blake3_leave( sha ) );
+}
+
 int
 main( int     argc,
       char ** argv ) {
@@ -146,15 +174,19 @@ main( int     argc,
   fd_lthash_t _hash[1];        fd_lthash_t *       hash     = _hash;
   fd_lthash_value_t _value[1]; fd_lthash_value_t * value    = _value;
   fd_lthash_value_t _tmp[1];   fd_lthash_value_t * tmp      = _tmp;
-  uchar _expected[ 2048 ];     uchar *             expected = _expected;
   ushort compute_extected[1024];
+
+  uchar value32[32];
+  fd_blake3_hash( "hello", 5UL, value32 );
+  FD_TEST( fd_memeq( value32, lthash_hello, 32 ) );
 
   FD_TEST( fd_lthash_init( hash )==hash );
   FD_TEST( fd_lthash_append( hash, "hello", 5 )==hash );
   FD_TEST( fd_lthash_fini( hash, value )==value );
 
-  memcpy( expected, lthash_hello, 2048 );
-  if( FD_UNLIKELY( memcmp( value, expected, 2048 ) ) ) {
+  if( FD_UNLIKELY( memcmp( value, lthash_hello, 2048 ) ) ) {
+    FD_LOG_HEXDUMP_WARNING(( "want", lthash_hello, 2048 ));
+    FD_LOG_HEXDUMP_WARNING(( "have", value,        2048 ));
     FD_LOG_ERR(( "FAIL lthash('hello')" ));
   }
 
@@ -162,8 +194,7 @@ main( int     argc,
   FD_TEST( fd_lthash_append( hash, "world!", 6 )==hash );
   FD_TEST( fd_lthash_fini( hash, tmp )==tmp );
 
-  memcpy( expected, lthash_world, 2048 );
-  if( FD_UNLIKELY( memcmp( tmp, expected, 2048 ) ) ) {
+  if( FD_UNLIKELY( memcmp( tmp, lthash_world, 2048 ) ) ) {
     FD_LOG_ERR(( "FAIL lthash('world!')" ));
   }
 
@@ -171,6 +202,7 @@ main( int     argc,
   for ( ulong i=0; i<1024; i++ ) {
     compute_extected[i] = (ushort)( lthash_hello[i] + lthash_world[i] );
   }
+  uchar expected[ 2048 ];
   memcpy( expected, compute_extected, 2048 );
   if( FD_UNLIKELY( memcmp( value, expected, 2048 ) ) ) {
     FD_LOG_ERR(( "FAIL lthash('hello')+lthash('world!')" ));
@@ -203,6 +235,14 @@ main( int     argc,
   if( FD_UNLIKELY( memcmp( value, expected, 2048 ) ) ) {
     FD_LOG_ERR(( "FAIL fd_lthash_zero()" ));
   }
+  FD_LOG_NOTICE(( "OK: streaming lthash" ));
+
+  test_lthash_adder();
+  FD_LOG_NOTICE(( "OK: lthash_adder" ));
+
+  bench_lthash_seq();
+
+  bench_lthash_adder();
 
   fd_rng_delete( fd_rng_leave( rng ) );
   FD_LOG_NOTICE(( "pass" ));

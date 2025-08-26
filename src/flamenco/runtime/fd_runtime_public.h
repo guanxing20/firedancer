@@ -11,26 +11,16 @@
 /* definition of the public/readable workspace */
 #define FD_RUNTIME_PUBLIC_MAGIC (0xF17EDA2C9A7B1C21UL)
 
-#define EXEC_NEW_TXN_SIG               (0x777777UL)
-#define EXEC_HASH_ACCS_SIG             (0x888888UL)
-#define EXEC_SNAP_HASH_ACCS_CNT_SIG    (0x191992UL)
-#define EXEC_SNAP_HASH_ACCS_GATHER_SIG (0x193992UL)
+#define EXEC_NEW_TXN_SIG         (0x777777UL)
 
-#define FD_WRITER_BOOT_SIG             (0xAABB0011UL)
-#define FD_WRITER_SLOT_SIG             (0xBBBB1122UL)
-#define FD_WRITER_TXN_SIG              (0xBBCC2233UL)
+#define FD_WRITER_BOOT_SIG       (0xAABB0011UL)
+#define FD_WRITER_SLOT_SIG       (0xBBBB1122UL)
+#define FD_WRITER_TXN_SIG        (0xBBCC2233UL)
 
-#define FD_EXEC_STATE_NOT_BOOTED       (0xFFFFFFFFUL)
-#define FD_EXEC_STATE_BOOTED           (1<<1UL      )
-#define FD_EXEC_STATE_HASH_DONE        (1<<6UL      )
-#define FD_EXEC_STATE_SNAP_CNT_DONE    (1<<8UL      )
-#define FD_EXEC_STATE_SNAP_GATHER_DONE (1<<9UL      )
+#define FD_EXEC_STATE_NOT_BOOTED (0xFFFFFFFFUL)
+#define FD_EXEC_STATE_BOOTED     (1<<1UL      )
 
-#define FD_WRITER_STATE_NOT_BOOTED     (0UL         )
-#define FD_WRITER_STATE_READY          (1UL         )
-#define FD_WRITER_STATE_TXN_DONE       (1UL<<1      )
-
-#define FD_EXEC_ID_SENTINEL            (UINT_MAX    )
+#define FD_EXEC_ID_SENTINEL      (UINT_MAX    )
 
 
 /* parallel execution apis ********************************************/
@@ -102,13 +92,6 @@ fd_exec_fseq_get_booted_offset( ulong fseq ) {
   return (uint)(fseq >> 32UL);
 }
 
-static ulong FD_FN_UNUSED
-fd_exec_fseq_set_hash_done( ulong slot ) {
-  ulong state = ((ulong)slot << 32UL);
-  state      |= FD_EXEC_STATE_HASH_DONE;
-  return state;
-}
-
 static uint FD_FN_UNUSED
 fd_exec_fseq_get_slot( ulong fseq ) {
   return (uint)(fseq >> 32UL);
@@ -119,21 +102,9 @@ fd_exec_fseq_get_bpf_id( ulong fseq ) {
   return (uint)(fseq >> 32UL);
 }
 
-static ulong FD_FN_UNUSED
-fd_exec_fseq_set_snap_hash_cnt_done( uint pairs_len ) {
-  ulong state = ((ulong)pairs_len << 32UL);
-  state      |= FD_EXEC_STATE_SNAP_CNT_DONE;
-  return state;
-}
-
 static uint FD_FN_UNUSED
 fd_exec_fseq_get_pairs_len( ulong fseq ) {
   return (uint)(fseq >> 32UL);
-}
-
-static ulong FD_FN_UNUSED
-fd_exec_fseq_set_snap_hash_gather_done( void ) {
-  return FD_EXEC_STATE_SNAP_GATHER_DONE;
 }
 
 static inline int
@@ -141,43 +112,6 @@ fd_exec_fseq_is_not_joined( ulong fseq ) {
   return fseq==ULONG_MAX;
 }
 
-/* Writer tile fseq management APIs ***********************************/
-
-/*
-   +----------------------------------+----------+----------------------+
-   |         Transaction ID           | Exec Tile|         State        |
-   |            (32 bits)             |   ID     |       (24 bits)      |
-   |                                  | (8 bits) |                      |
-   +----------------------------------+----------+----------------------+
- */
-
-static inline uint
-fd_writer_fseq_get_state( ulong fseq ) {
-  return (uint)(fseq & 0x00FFFFFFU);
-}
-
-static inline ulong
-fd_writer_fseq_set_txn_done( uint txn_id, uchar exec_tile_id ) {
-  ulong state = (((ulong)txn_id) << 32);
-  state      |= (((ulong)exec_tile_id) << 24);
-  state      |= FD_WRITER_STATE_TXN_DONE;
-  return state;
-}
-
-static inline uint
-fd_writer_fseq_get_txn_id( ulong fseq ) {
-  return (uint)(fseq >> 32);
-}
-
-static inline uchar
-fd_writer_fseq_get_exec_tile_id( ulong fseq ) {
-  return (uchar)((fseq >> 24) & 0xFFUL);
-}
-
-static inline int
-fd_writer_fseq_is_not_joined( ulong fseq ) {
-  return fseq==ULONG_MAX;
-}
 
 struct fd_runtime_public_txn_msg {
   ulong      slot;
@@ -193,13 +127,6 @@ struct fd_runtime_public_hash_bank_msg {
   ulong slot;
 };
 typedef struct fd_runtime_public_hash_bank_msg fd_runtime_public_hash_bank_msg_t;
-
-struct fd_runtime_public_snap_hash_msg {
-  ulong num_pairs_out_gaddr;
-  ulong lt_hash_value_out_gaddr;
-  ulong pairs_gaddr;
-};
-typedef struct fd_runtime_public_snap_hash_msg fd_runtime_public_snap_hash_msg_t;
 
 struct fd_runtime_public_exec_writer_boot_msg {
   uint txn_ctx_offset;
@@ -219,6 +146,34 @@ struct fd_runtime_public_replay_writer_slot_msg {
 };
 typedef struct fd_runtime_public_replay_writer_slot_msg fd_runtime_public_replay_writer_slot_msg_t;
 FD_STATIC_ASSERT( sizeof(fd_runtime_public_replay_writer_slot_msg_t)<=FD_REPLAY_WRITER_MTU, replay_writer_msg_mtu );
+
+/* FD_ACC_SZ_MAX is the hardcoded size limit of a Solana account. */
+#define FD_ACC_SZ_MAX       (10UL<<20) /* 10MiB */
+
+/* Writer->Replay message APIs **************************************/
+#define FD_RUNTIME_PUBLIC_WRITER_REPLAY_SIG_TXN_DONE   (1UL) /* txn finalized */
+#define FD_RUNTIME_PUBLIC_WRITER_REPLAY_SIG_ACC_UPDATE (2UL) /* solcap account update */
+
+/* Message sent from writer tile to replay tile,
+   notifying the solcap writer that an account update has occurred. */
+struct __attribute__((packed)) fd_runtime_public_account_update_msg {
+  fd_pubkey_t              pubkey;
+  fd_solana_account_meta_t info;
+  ulong                    data_sz;
+  fd_hash_t                hash;
+  /* Account data follows immediately after this struct */
+};
+typedef struct fd_runtime_public_account_update_msg fd_runtime_public_account_update_msg_t;
+#define FD_RUNTIME_PUBLIC_ACCOUNT_UPDATE_MSG_FOOTPRINT (FD_ACC_SZ_MAX + sizeof(fd_runtime_public_account_update_msg_t))
+FD_STATIC_ASSERT( sizeof(fd_runtime_public_account_update_msg_t) == 124, account_update_msg_mtu );
+
+/* Message sent from writer tile to replay tile,
+   notifying the replay tile that a txn has been finalized. */
+struct __attribute__((packed)) fd_runtime_public_writer_replay_txn_finalized {
+  uint txn_id;
+  int  exec_tile_id;
+};
+typedef struct fd_runtime_public_writer_replay_txn_finalized fd_runtime_public_writer_replay_txn_finalized_t;
 
 struct fd_runtime_public {
   /* FIXME:  This is a non-fork-aware copy of the currently active

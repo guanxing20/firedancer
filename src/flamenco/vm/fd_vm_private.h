@@ -1,7 +1,6 @@
 #ifndef HEADER_fd_src_flamenco_vm_fd_vm_private_h
 #define HEADER_fd_src_flamenco_vm_fd_vm_private_h
 
-#include "../runtime/tests/fd_dump_pb.h"
 #include "fd_vm.h"
 
 #include "../../ballet/sbpf/fd_sbpf_instr.h"
@@ -75,6 +74,8 @@ struct __attribute__((packed)) fd_vm_vec {
 
 typedef struct fd_vm_vec fd_vm_vec_t;
 
+FD_STATIC_ASSERT( sizeof(fd_vm_vec_t)==FD_VM_VEC_SIZE, fd_vm_vec size mismatch );
+
 /* SBPF version and features
    https://github.com/solana-labs/rbpf/blob/4b2c3dfb02827a0119cd1587eea9e27499712646/src/program.rs#L22
 
@@ -106,8 +107,10 @@ typedef struct fd_vm_vec fd_vm_vec_t;
 /* SIMD-0178 + SIMD-0179 */
 #define FD_VM_SBPF_STATIC_SYSCALLS(v)              ( v >= FD_SBPF_V3 )
 /* SIMD-0189 */
-#define FD_VM_SBPF_ENABLE_STRICTER_ELF_HEADERS(v)  ( v >= FD_SBPF_V3 )
 #define FD_VM_SBPF_ENABLE_LOWER_BYTECODE_VADDR(v)  ( v >= FD_SBPF_V3 )
+/* enable_strict_elf_headers is defined in fd_sbpf_loader.h because it's needed
+   by the ELF loader, not really by the VM
+   #define FD_VM_SBPF_ENABLE_STRICTER_ELF_HEADERS(v)  ( v >= FD_SBPF_V3 ) */
 
 #define FD_VM_SBPF_DYNAMIC_STACK_FRAMES_ALIGN      (64U)
 

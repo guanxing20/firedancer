@@ -2,10 +2,12 @@
 #include "../../platform/fd_sys_util.h"
 #include "../../shared/commands/configure/configure.h"
 #include "../../shared/commands/run/run.h"
+#include "../../shared_dev/commands/dev.h"
 #include "../../../disco/metrics/fd_metrics.h"
 #include "../../../disco/topo/fd_topob.h"
 #include "../../../util/tile/fd_tile_private.h"
 #include "../../../discof/restore/utils/fd_ssmsg.h"
+
 #include <sys/resource.h>
 #include <linux/capability.h>
 #include <unistd.h>
@@ -84,8 +86,7 @@ snapshot_load_topo( config_t *     config,
 
   /* snapshot manifest out link */
   fd_topob_wksp( topo, "snap_out" );
-  FD_TEST( sizeof(fd_snapshot_manifest_t)<(5UL*(1UL<<30UL)) );
-  fd_topo_link_t * snap_out_link = fd_topob_link( topo, "snap_out", "snap_out", 2UL, 5UL*(1UL<<30UL), 1UL );
+  fd_topo_link_t * snap_out_link = fd_topob_link( topo, "snap_out", "snap_out", 2UL, sizeof(fd_snapshot_manifest_t), 1UL );
   snap_out_link->permit_no_consumers = 1;
   fd_topob_tile_out( topo, "snapin", 0UL, "snap_out", 0UL );
 
@@ -124,16 +125,6 @@ snapshot_load_cmd_args( int *    pargc,
   }
 }
 
-static void
-snapshot_load_cmd_perm( args_t *         args,
-                        fd_cap_chk_t *   chk,
-                        config_t const * config ) {
-  (void)args;
-  ulong mlock_limit = fd_topo_mlock_max_tile( &config->topo );
-  fd_cap_chk_raise_rlimit( chk, NAME, RLIMIT_MEMLOCK, mlock_limit, "call `rlimit(2)` to increase `RLIMIT_MEMLOCK` so all memory can be locked with `mlock(2)`" );
-  fd_cap_chk_raise_rlimit( chk, NAME, RLIMIT_NICE,    40,          "call `setpriority(2)` to increase thread priorities" );
-}
-
 extern int * fd_log_private_shared_lock;
 
 static void
@@ -150,7 +141,7 @@ snapshot_load_cmd_fn( args_t *   args,
     configure_args.configure.stages[ i ] = STAGES[ i ];
   configure_cmd_fn( &configure_args, config );
 
-  run_firedancer_init( config, 1 );
+  run_firedancer_init( config, 1, 0 );
 
   fd_log_private_shared_lock[ 1 ] = 0;
   fd_topo_join_workspaces( topo, FD_SHMEM_JOIN_MODE_READ_WRITE );
@@ -244,6 +235,6 @@ snapshot_load_cmd_fn( args_t *   args,
 action_t fd_action_snapshot_load = {
   .name = NAME,
   .args = snapshot_load_cmd_args,
-  .perm = snapshot_load_cmd_perm,
+  .perm = dev_cmd_perm,
   .fn   = snapshot_load_cmd_fn
 };
