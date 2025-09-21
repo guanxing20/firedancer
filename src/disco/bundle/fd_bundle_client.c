@@ -25,6 +25,8 @@
 
 #define FD_BUNDLE_CLIENT_REQUEST_TIMEOUT ((long)8e9) /* 8 seconds */
 
+#define FD_BUNDLE_CLIENT_MAX_TXN_PER_BUNDLE (5UL)
+
 __attribute__((weak)) long
 fd_bundle_now( void ) {
   return fd_log_wallclock();
@@ -339,8 +341,12 @@ fd_bundle_client_step1( fd_bundle_tile_t * ctx,
 
   /* gRPC conn died? */
   if( FD_UNLIKELY( !ctx->grpc_client ) ) {
+    long sleep_start;
   reconnect:
-    if( FD_UNLIKELY( fd_bundle_tile_should_stall( ctx, fd_bundle_now() ) ) ) {
+    sleep_start = fd_bundle_now();
+    if( FD_UNLIKELY( fd_bundle_tile_should_stall( ctx, sleep_start ) ) ) {
+      long wait_dur = ctx->backoff_until - sleep_start;
+      fd_log_sleep( fd_long_min( wait_dur, 1e6 ) );
       return;
     }
     fd_bundle_client_create_conn( ctx );
@@ -599,7 +605,6 @@ fd_bundle_client_visit_pb_bundle_uuid(
   /* Reset bundle state */
 
   ctx->bundle_txn_cnt = 0UL;
-  ctx->bundle_seq++;
 
   /* Do two decode passes.  This is required because we need to know the
      number of transactions in a bundle ahead of time.  However, due to
@@ -620,9 +625,14 @@ fd_bundle_client_visit_pb_bundle_uuid(
     return false;
   }
 
-  /* At this opint, ctx->bundle_txn_cnt is correctly set.
+  /* At this opint, ctx->bundle_txn_cnt is correctly set.  Too many txns
+     is treated as a NOP.
+
      Second pass: Actually publish bundle packets */
 
+  if( FD_UNLIKELY( ctx->bundle_txn_cnt>FD_BUNDLE_CLIENT_MAX_TXN_PER_BUNDLE ) ) return true;
+
+  ctx->bundle_seq++;
   bundle = (bundle_BundleUuid)bundle_BundleUuid_init_default;
   bundle.bundle.packets = (pb_callback_t) {
     .funcs.decode = fd_bundle_client_visit_pb_bundle_txn,

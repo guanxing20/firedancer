@@ -76,9 +76,6 @@ dump_account_state( fd_txn_account_t const *    txn_account,
     // Executable
     output_account->executable = (bool)fd_txn_account_is_executable( txn_account );
 
-    // Rent epoch
-    output_account->rent_epoch = (uint64_t)fd_txn_account_get_rent_epoch( txn_account );
-
     // Owner
     fd_memcpy(output_account->owner, fd_txn_account_get_owner( txn_account ), sizeof(fd_pubkey_t));
 
@@ -466,21 +463,19 @@ create_block_context_protobuf_from_block( fd_exec_test_block_context_t * block_c
 
   /* Dumping stake accounts for this epoch */
 
-  fd_stake_delegation_map_t * map = fd_stake_delegations_get_map( stake_delegations );
-  fd_stake_delegation_t *     pool = fd_stake_delegations_get_pool( stake_delegations );
-
-  for( fd_stake_delegation_map_iter_t iter = fd_stake_delegation_map_iter_init( map, pool );
-       !fd_stake_delegation_map_iter_done( iter, map, pool );
-       iter = fd_stake_delegation_map_iter_next( iter, map, pool ) ) {
-    fd_stake_delegation_t * stake_delegation = fd_stake_delegation_map_iter_ele( iter, map, pool );
+  fd_stake_delegations_iter_t iter_[1];
+  for( fd_stake_delegations_iter_t * iter = fd_stake_delegations_iter_init( iter_, stake_delegations );
+       !fd_stake_delegations_iter_done( iter );
+       fd_stake_delegations_iter_next( iter ) ) {
+    fd_stake_delegation_t * stake_delegation = fd_stake_delegations_iter_ele( iter );
     dump_account_if_not_already_dumped( slot_ctx->funk, slot_ctx->funk_txn, &stake_delegation->stake_account, spad, block_context->acct_states, &block_context->acct_states_count, NULL );
   }
 
   /* Dumping vote accounts for this epoch */
 
   vote_states = fd_bank_vote_states_locking_query( slot_ctx->bank );
-  fd_vote_states_iter_t iter_[1];
-  for( fd_vote_states_iter_t * iter = fd_vote_states_iter_init( iter_, vote_states ); !fd_vote_states_iter_done( iter ); fd_vote_states_iter_next( iter ) ) {
+  fd_vote_states_iter_t vote_iter_[1];
+  for( fd_vote_states_iter_t * iter = fd_vote_states_iter_init( vote_iter_, vote_states ); !fd_vote_states_iter_done( iter ); fd_vote_states_iter_next( iter ) ) {
     fd_vote_state_ele_t const * vote_state = fd_vote_states_iter_ele( iter );
     dump_account_if_not_already_dumped( slot_ctx->funk, slot_ctx->funk_txn, &vote_state->vote_account, spad, block_context->acct_states, &block_context->acct_states_count, NULL );
   }
@@ -581,8 +576,8 @@ static void
 create_txn_context_protobuf_from_txn( fd_exec_test_txn_context_t * txn_context_msg,
                                       fd_exec_txn_ctx_t *          txn_ctx,
                                       fd_spad_t *                  spad ) {
-  fd_txn_t const * txn_descriptor = txn_ctx->txn_descriptor;
-  uchar const *    txn_payload    = (uchar const *) txn_ctx->_txn_raw->raw;
+  fd_txn_t const * txn_descriptor = TXN( &txn_ctx->txn );
+  uchar const *    txn_payload    = (uchar const *) txn_ctx->txn.payload;
 
   /* We don't want to store builtins in account shared data */
   fd_pubkey_t const loaded_builtins[] = {
@@ -859,7 +854,7 @@ fd_dump_instr_to_protobuf( fd_exec_txn_ctx_t * txn_ctx,
                            ushort              instruction_idx ) {
   FD_SPAD_FRAME_BEGIN( txn_ctx->spad ) {
     // Get base58-encoded tx signature
-    const fd_ed25519_sig_t * signatures = fd_txn_get_signatures( txn_ctx->txn_descriptor, txn_ctx->_txn_raw->raw );
+    const fd_ed25519_sig_t * signatures = fd_txn_get_signatures( TXN( &txn_ctx->txn ), txn_ctx->txn.payload );
     fd_ed25519_sig_t signature; fd_memcpy( signature, signatures[0], sizeof(fd_ed25519_sig_t) );
     char encoded_signature[FD_BASE58_ENCODED_64_SZ];
     ulong out_size;
@@ -905,7 +900,7 @@ void
 fd_dump_txn_to_protobuf( fd_exec_txn_ctx_t * txn_ctx, fd_spad_t * spad ) {
   FD_SPAD_FRAME_BEGIN( spad ) {
     // Get base58-encoded tx signature
-    const fd_ed25519_sig_t * signatures = fd_txn_get_signatures( txn_ctx->txn_descriptor, txn_ctx->_txn_raw->raw );
+    const fd_ed25519_sig_t * signatures = fd_txn_get_signatures( TXN( &txn_ctx->txn ), txn_ctx->txn.payload );
     fd_ed25519_sig_t signature; fd_memcpy( signature, signatures[0], sizeof(fd_ed25519_sig_t) );
     char encoded_signature[FD_BASE58_ENCODED_64_SZ];
     ulong out_size;
@@ -1000,7 +995,7 @@ fd_dump_vm_syscall_to_protobuf( fd_vm_t const * vm,
 FD_SPAD_FRAME_BEGIN( vm->instr_ctx->txn_ctx->spad ) {
 
   fd_ed25519_sig_t signature;
-  memcpy( signature, (uchar const *)vm->instr_ctx->txn_ctx->_txn_raw->raw + vm->instr_ctx->txn_ctx->txn_descriptor->signature_off, sizeof(fd_ed25519_sig_t) );
+  memcpy( signature, (uchar const *)vm->instr_ctx->txn_ctx->txn.payload + TXN( &vm->instr_ctx->txn_ctx->txn )->signature_off, sizeof(fd_ed25519_sig_t) );
   char encoded_signature[FD_BASE58_ENCODED_64_SZ];
   fd_base58_encode_64( signature, NULL, encoded_signature );
 
@@ -1128,7 +1123,7 @@ FD_SPAD_FRAME_BEGIN( txn_ctx->spad ) {
 
   /* Serialize the ELF to protobuf */
   fd_ed25519_sig_t signature;
-  memcpy( signature, (uchar const *)txn_ctx->_txn_raw->raw + txn_ctx->txn_descriptor->signature_off, sizeof(fd_ed25519_sig_t) );
+  memcpy( signature, (uchar const *)txn_ctx->txn.payload + TXN( &txn_ctx->txn )->signature_off, sizeof(fd_ed25519_sig_t) );
   char encoded_signature[FD_BASE58_ENCODED_64_SZ];
   fd_base58_encode_64( signature, NULL, encoded_signature );
 

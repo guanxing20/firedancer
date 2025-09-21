@@ -286,7 +286,7 @@ generic_program_to_json( fd_webserver_t * ws,
     fd_web_reply_encode_base58(ws, raw + instr->data_off, instr->data_sz);
     char buf32[FD_BASE58_ENCODED_32_SZ];
     fd_base58_encode_32((const uchar*)(accts + instr->program_id), NULL, buf32);
-    fd_web_reply_sprintf(ws, "\",\"program\":\"unknown\",\"programId\":\"%s\",\"stackHeight\":null}", buf32);
+    fd_web_reply_sprintf(ws, "\",\"program\":\"unknown\",\"programId\":\"%s\",\"stackHeight\":1}", buf32);
     *need_comma = 1;
   } FD_SPAD_FRAME_END;
   return NULL;
@@ -320,7 +320,7 @@ vote_program_to_json( fd_webserver_t * ws,
     fd_rpc_json_t * json = fd_rpc_json_init( fd_rpc_json_new( fd_spad_alloc( spad, fd_rpc_json_align(), fd_rpc_json_footprint() ) ), ws );
     fd_vote_instruction_walk( json, instruction, fd_rpc_json_walk, NULL, 0, 0 );
 
-    EMIT_SIMPLE(",\"program\":\"vote\",\"programId\":\"Vote111111111111111111111111111111111111111\",\"stackHeight\":null}");
+    EMIT_SIMPLE(",\"program\":\"vote\",\"programId\":\"Vote111111111111111111111111111111111111111\",\"stackHeight\":1}");
     *need_comma = 1;
   } FD_SPAD_FRAME_END;
   return NULL;
@@ -354,7 +354,7 @@ system_program_to_json( fd_webserver_t * ws,
     fd_rpc_json_t * json = fd_rpc_json_init( fd_rpc_json_new( fd_spad_alloc( spad, fd_rpc_json_align(), fd_rpc_json_footprint() ) ), ws );
     fd_system_program_instruction_walk( json, instruction, fd_rpc_json_walk, NULL, 0, 0 );
 
-    EMIT_SIMPLE(",\"program\":\"system\",\"programId\":\"11111111111111111111111111111111\",\"stackHeight\":null}");
+    EMIT_SIMPLE(",\"program\":\"system\",\"programId\":\"11111111111111111111111111111111\",\"stackHeight\":1}");
     *need_comma = 1;
   } FD_SPAD_FRAME_END;
   return NULL;
@@ -412,7 +412,7 @@ compute_budget_program_to_json( fd_webserver_t * ws,
     fd_rpc_json_t * json = fd_rpc_json_init( fd_rpc_json_new( fd_spad_alloc( spad, fd_rpc_json_align(), fd_rpc_json_footprint() ) ), ws );
     fd_compute_budget_program_instruction_walk( json, instruction, fd_rpc_json_walk, NULL, 0, 0 );
 
-    EMIT_SIMPLE(",\"program\":\"compute_budget\",\"programId\":\"ComputeBudget111111111111111111111111111111\",\"stackHeight\":null}");
+    EMIT_SIMPLE(",\"program\":\"compute_budget\",\"programId\":\"ComputeBudget111111111111111111111111111111\",\"stackHeight\":1}");
     *need_comma = 1;
   } FD_SPAD_FRAME_END;
   return NULL;
@@ -471,7 +471,7 @@ fd_instr_to_json( fd_webserver_t * ws,
     }
     EMIT_SIMPLE("],\"data\":\"");
     fd_web_reply_encode_base58(ws, raw + instr->data_off, instr->data_sz);
-    fd_web_reply_sprintf(ws, "\",\"programIdIndex\":%u,\"stackHeight\":null}", (uint)instr->program_id);
+    fd_web_reply_sprintf(ws, "\",\"programIdIndex\":%u,\"stackHeight\":%u}", (uint)instr->program_id, (uint)1);
     *need_comma = 1;
 
   } else if( encoding == FD_ENC_JSON_PARSED ) {
@@ -588,9 +588,12 @@ fd_txn_to_json_full( fd_webserver_t * ws,
     EMIT_SIMPLE("],");
   }
 
-  fd_web_reply_sprintf(ws, "\"header\":{\"numReadonlySignedAccounts\":%u,\"numReadonlyUnsignedAccounts\":%u,\"numRequiredSignatures\":%u},\"instructions\":[",
-                       (uint)txn->readonly_signed_cnt, (uint)txn->readonly_unsigned_cnt, (uint)txn->signature_cnt);
+  if( encoding == FD_ENC_JSON ) {
+    fd_web_reply_sprintf(ws, "\"header\":{\"numReadonlySignedAccounts\":%u,\"numReadonlyUnsignedAccounts\":%u,\"numRequiredSignatures\":%u},",
+                         (uint)txn->readonly_signed_cnt, (uint)txn->readonly_unsigned_cnt, (uint)txn->signature_cnt);
+  }
 
+  EMIT_SIMPLE("\"instructions\":[");
   ushort instr_cnt = txn->instr_cnt;
   int need_comma = 0;
   for (ushort idx = 0; idx < instr_cnt; idx++) {
@@ -677,8 +680,8 @@ fd_block_to_json( fd_webserver_t * ws,
                   const char * call_id,
                   const uchar * blk_data,
                   ulong blk_sz,
-                  fd_replay_notif_msg_t * info,
-                  fd_replay_notif_msg_t * parent_info,
+                  fd_replay_slot_completed_t * info,
+                  fd_replay_slot_completed_t * parent_info,
                   fd_rpc_encoding_t encoding,
                   long maxvers,
                   enum fd_block_detail detail,
@@ -687,15 +690,16 @@ fd_block_to_json( fd_webserver_t * ws,
   EMIT_SIMPLE("{\"jsonrpc\":\"2.0\",\"result\":{");
 
   char hash[50];
-  fd_base58_encode_32(info->slot_exec.block_hash.uc, 0, hash);
+  fd_base58_encode_32(info->block_hash.uc, 0, hash);
   char phash[50];
   if( parent_info ) {
-    fd_base58_encode_32(parent_info->slot_exec.block_hash.uc, 0, phash);
+    fd_base58_encode_32(parent_info->block_hash.uc, 0, phash);
   } else {
     phash[0] = '\0';
   }
-  fd_web_reply_sprintf(ws, "\"blockHeight\":%lu,\"blockTime\":%lu,\"parentSlot\":%lu,\"blockhash\":\"%s\",\"previousBlockhash\":\"%s\"",
-                       info->slot_exec.height, info->slot_exec.ts/(ulong)1e9, info->slot_exec.parent, hash, phash);
+  // TODO: local completion time is not block time
+  fd_web_reply_sprintf(ws, "\"blockHeight\":%lu,\"blockTime\":%ld,\"parentSlot\":%lu,\"blockhash\":\"%s\",\"previousBlockhash\":\"%s\"",
+                       info->block_height, info->completion_time_nanos/(long)1e9, info->parent_slot, hash, phash);
 
   if( rewards ) {
     fd_base58_encode_32(rewards->leader.uc, 0, hash);
@@ -828,11 +832,11 @@ fd_account_to_json( fd_webserver_t * ws,
   fd_web_reply_sprintf(ws, "{\"data\":[\"");
 
   fd_account_meta_t * metadata = (fd_account_meta_t *)val;
-  if (val_sz < sizeof(fd_account_meta_t) && val_sz < metadata->hlen) {
+  if (val_sz < sizeof(fd_account_meta_t)) {
     return "failed to load account data";
   }
-  val = (uchar*)val + metadata->hlen;
-  val_sz = val_sz - metadata->hlen;
+  val = (uchar*)val + sizeof(fd_account_meta_t);
+  val_sz = val_sz - sizeof(fd_account_meta_t);
   if (val_sz > metadata->dlen)
     val_sz = metadata->dlen;
 
@@ -888,16 +892,16 @@ fd_account_to_json( fd_webserver_t * ws,
   }
 
   char owner[50];
-  fd_base58_encode_32((uchar*)metadata->info.owner, 0, owner);
+  fd_base58_encode_32((uchar*)metadata->owner, 0, owner);
   char addr[50];
   fd_base58_encode_32(acct.uc, 0, addr);
   fd_web_reply_sprintf(ws, "\",\"%s\"],\"executable\":%s,\"lamports\":%lu,\"owner\":\"%s\",\"address\":\"%s\",\"rentEpoch\":%lu,\"space\":%lu}",
                        encstr,
-                       (metadata->info.executable ? "true" : "false"),
-                       metadata->info.lamports,
+                       (metadata->executable ? "true" : "false"),
+                       metadata->lamports,
                        owner,
                        addr,
-                       metadata->info.rent_epoch,
+                       ULONG_MAX,
                        val_sz);
 
   return NULL;

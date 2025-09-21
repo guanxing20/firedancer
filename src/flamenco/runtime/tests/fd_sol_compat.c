@@ -1,3 +1,4 @@
+#include "fd_solfuzz.h"
 #include "fd_solfuzz_private.h"
 #define _GNU_SOURCE
 #include "fd_sol_compat.h"
@@ -22,8 +23,8 @@ static fd_wksp_t *           wksp   = NULL;
 static fd_solfuzz_runner_t * runner = NULL;
 
 static fd_solfuzz_runner_t *
-sol_compat_setup_runner( void ) {
-  runner = fd_solfuzz_runner_new( wksp, 3UL );
+sol_compat_setup_runner( fd_solfuzz_runner_options_t const * options ) {
+  runner = fd_solfuzz_runner_new( wksp, 3UL, options );
   if( FD_UNLIKELY( !runner ) ) {
     FD_LOG_ERR(( "fd_solfuzz_runner_new() failed" ));
     return NULL;
@@ -67,6 +68,13 @@ sol_compat_init( int log_level ) {
   if( !getenv( "FD_LOG_PATH" ) ) {
     setenv( "FD_LOG_PATH", "", 1 );
   }
+
+  char const * enable_vm_tracing_env  = getenv( "ENABLE_VM_TRACING");
+  int enable_vm_tracing               = enable_vm_tracing_env!=NULL;
+  fd_solfuzz_runner_options_t options = {
+    .enable_vm_tracing = enable_vm_tracing
+  };
+
   fd_log_enable_unclean_exit();
   fd_boot( &argc, &argv_ );
 
@@ -74,13 +82,13 @@ sol_compat_init( int log_level ) {
     FD_LOG_ERR(( "sol_compat_init() called multiple times" ));
   }
 
-  ulong footprint = 6UL<<30;
+  ulong footprint = 7UL<<30;
   ulong part_max  = fd_wksp_part_max_est( footprint, 64UL<<10 );
   ulong data_max  = fd_wksp_data_max_est( footprint, part_max );
   wksp = fd_wksp_demand_paged_new( "sol_compat", 42U, part_max, data_max );
   if( FD_UNLIKELY( !wksp ) ) FD_LOG_ERR(( "fd_wksp_demand_paged_new() failed" ));
 
-  runner = sol_compat_setup_runner();
+  runner = sol_compat_setup_runner( &options );
   if( FD_UNLIKELY( !runner ) ) FD_LOG_ERR(( "sol_compat_setup_runner() failed" ));
 
   fd_log_level_logfile_set( log_level );
@@ -134,7 +142,7 @@ sol_compat_instr_execute_v1( uchar *       out,
                              uchar const * in,
                              ulong         in_sz ) {
   fd_exec_test_instr_context_t input[1] = {0};
-  void * res = sol_compat_decode( &input, in, in_sz, &fd_exec_test_instr_context_t_msg );
+  void * res = sol_compat_decode_lenient( &input, in, in_sz, &fd_exec_test_instr_context_t_msg );
   if( FD_UNLIKELY( !res ) ) return 0;
 
   int ok = 0;
@@ -156,7 +164,7 @@ sol_compat_txn_execute_v1( uchar *       out,
                            uchar const * in,
                            ulong         in_sz ) {
   fd_exec_test_txn_context_t input[1] = {0};
-  void * res = sol_compat_decode( &input, in, in_sz, &fd_exec_test_txn_context_t_msg );
+  void * res = sol_compat_decode_lenient( &input, in, in_sz, &fd_exec_test_txn_context_t_msg );
   if( FD_UNLIKELY( !res ) ) return 0;
 
   int ok = 0;
@@ -178,7 +186,7 @@ sol_compat_block_execute_v1( uchar *       out,
                              uchar const * in,
                              ulong         in_sz ) {
   fd_exec_test_block_context_t input[1] = {0};
-  void * res = sol_compat_decode( &input, in, in_sz, &fd_exec_test_block_context_t_msg );
+  void * res = sol_compat_decode_lenient( &input, in, in_sz, &fd_exec_test_block_context_t_msg );
   if( FD_UNLIKELY( !res ) ) return 0;
 
   fd_spad_push( runner->spad );
@@ -222,7 +230,7 @@ sol_compat_vm_syscall_execute_v1( uchar *       out,
                                   uchar const * in,
                                   ulong         in_sz ) {
   fd_exec_test_syscall_context_t input[1] = {0};
-  void * res = sol_compat_decode( &input, in, in_sz, &fd_exec_test_syscall_context_t_msg );
+  void * res = sol_compat_decode_lenient( &input, in, in_sz, &fd_exec_test_syscall_context_t_msg );
   if( FD_UNLIKELY( !res ) ) return 0;
 
   fd_spad_push( runner->spad );
@@ -244,7 +252,7 @@ sol_compat_vm_interp_v1( uchar *       out,
                          uchar const * in,
                          ulong         in_sz ) {
   fd_exec_test_syscall_context_t input[1] = {0};
-  void * res = sol_compat_decode( &input, in, in_sz, &fd_exec_test_syscall_context_t_msg );
+  void * res = sol_compat_decode_lenient( &input, in, in_sz, &fd_exec_test_syscall_context_t_msg );
   if( FD_UNLIKELY( !res ) ) return 0;
 
   fd_spad_push( runner->spad );
@@ -266,7 +274,7 @@ sol_compat_shred_parse_v1( uchar *       out,
                            uchar const * in,
                            ulong         in_sz ) {
     fd_exec_test_shred_binary_t input[1] = {0};
-    void                      * res      = sol_compat_decode( &input, in, in_sz, &fd_exec_test_shred_binary_t_msg );
+    void                      * res      = sol_compat_decode_lenient( &input, in, in_sz, &fd_exec_test_shred_binary_t_msg );
     if( FD_UNLIKELY( res==NULL ) ) {
         return 0;
     }
@@ -288,7 +296,7 @@ sol_compat_type_execute_v1( uchar *       out,
   // Setup
   // Decode context
   fd_exec_test_type_context_t input[1] = {0};
-  void * res = sol_compat_decode( &input, in, in_sz, &fd_exec_test_type_context_t_msg );
+  void * res = sol_compat_decode_lenient( &input, in, in_sz, &fd_exec_test_type_context_t_msg );
   if( FD_UNLIKELY( !res ) ) return 0;
 
   fd_spad_push( runner->spad );

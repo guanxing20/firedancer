@@ -147,7 +147,6 @@ do{
   fd_vm_acc_region_meta_t  acc_region_metas[256]                   = {0}; /* instr acc idx to idx */
   uint                     input_mem_regions_cnt                   = 0U;
   int                      direct_mapping                          = FD_FEATURE_ACTIVE( instr_ctx->txn_ctx->slot, &instr_ctx->txn_ctx->features, bpf_account_data_direct_mapping );
-  int                      mask_out_rent_epoch_in_vm_serialization = FD_FEATURE_ACTIVE( instr_ctx->txn_ctx->slot, &instr_ctx->txn_ctx->features, mask_out_rent_epoch_in_vm_serialization );
 
   uchar *                  input_ptr      = NULL;
   uchar                    program_id_idx = instr_ctx->instr->program_id;
@@ -171,7 +170,6 @@ do{
                                                       &input_mem_regions_cnt,
                                                       acc_region_metas,
                                                       direct_mapping,
-                                                      mask_out_rent_epoch_in_vm_serialization,
                                                       is_deprecated,
                                                       &input_ptr );
   if( FD_UNLIKELY( err ) ) {
@@ -217,14 +215,11 @@ do{
   }
 
   /* Setup trace */
-  const uint DUMP_TRACE = 0; // Set to 1 to dump trace to stdout
-  uint tracing_enabled = input->vm_ctx.tracing_enabled;
-  fd_vm_trace_t * trace = NULL;
-  ulong event_max = 1UL<<20;
-  ulong event_data_max = 2048UL;
+  const int enable_vm_tracing = runner->enable_vm_tracing;
+  fd_vm_trace_t * trace       = NULL;
 
-  if (!!tracing_enabled) {
-    trace = fd_vm_trace_new( fd_spad_alloc_check( spad, fd_vm_trace_align(), fd_vm_trace_footprint( event_max, event_data_max ) ), event_max, event_data_max );
+  if ( FD_UNLIKELY( enable_vm_tracing ) ) {
+    trace = fd_vm_trace_new( fd_spad_alloc_check( spad, fd_vm_trace_align(), fd_vm_trace_footprint( FD_RUNTIME_VM_TRACE_EVENT_MAX, FD_RUNTIME_VM_TRACE_EVENT_DATA_MAX ) ), FD_RUNTIME_VM_TRACE_EVENT_MAX, FD_RUNTIME_VM_TRACE_EVENT_DATA_MAX );
   }
 
   /* Setup vm */
@@ -297,9 +292,9 @@ do{
 
   /* Run vm */
   int exec_res = 0;
-  if (!!tracing_enabled) {
+  if ( FD_UNLIKELY( enable_vm_tracing ) ) {
     exec_res = fd_vm_exec_trace( vm );
-    if( DUMP_TRACE ) fd_vm_trace_printf( trace, syscalls );
+    if( enable_vm_tracing ) fd_vm_trace_printf( trace, syscalls );
     fd_vm_trace_delete( fd_vm_trace_leave( trace ) );
   } else {
     exec_res = fd_vm_exec_notrace( vm );
@@ -450,13 +445,12 @@ fd_solfuzz_syscall_run( fd_solfuzz_runner_t * runner,
   /* If the program ID account owner is the v1 BPF loader, then alignment is disabled (controlled by
      the `is_deprecated` flag) */
 
-  ulong                   input_sz                                = 0UL;
-  ulong                   pre_lens[256]                           = {0};
-  fd_vm_input_region_t    input_mem_regions[1000]                 = {0}; /* We can have a max of (3 * num accounts + 1) regions */
-  fd_vm_acc_region_meta_t acc_region_metas[256]                   = {0}; /* instr acc idx to idx */
-  uint                    input_mem_regions_cnt                   = 0U;
-  int                     direct_mapping                          = FD_FEATURE_ACTIVE( ctx->txn_ctx->slot, &ctx->txn_ctx->features, bpf_account_data_direct_mapping );
-  int                     mask_out_rent_epoch_in_vm_serialization = FD_FEATURE_ACTIVE( ctx->txn_ctx->slot, &ctx->txn_ctx->features, mask_out_rent_epoch_in_vm_serialization );
+  ulong                   input_sz                = 0UL;
+  ulong                   pre_lens[256]           = {0};
+  fd_vm_input_region_t    input_mem_regions[1000] = {0}; /* We can have a max of (3 * num accounts + 1) regions */
+  fd_vm_acc_region_meta_t acc_region_metas[256]   = {0}; /* instr acc idx to idx */
+  uint                    input_mem_regions_cnt   = 0U;
+  int                     direct_mapping          = FD_FEATURE_ACTIVE( ctx->txn_ctx->slot, &ctx->txn_ctx->features, bpf_account_data_direct_mapping );
 
   uchar *            input_ptr      = NULL;
   uchar              program_id_idx = ctx->instr->program_id;
@@ -479,7 +473,6 @@ fd_solfuzz_syscall_run( fd_solfuzz_runner_t * runner,
                                                       &input_mem_regions_cnt,
                                                       acc_region_metas,
                                                       direct_mapping,
-                                                      mask_out_rent_epoch_in_vm_serialization,
                                                       is_deprecated,
                                                       &input_ptr );
   if( FD_UNLIKELY( err ) ) {

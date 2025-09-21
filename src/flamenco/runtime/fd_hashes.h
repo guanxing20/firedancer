@@ -4,8 +4,6 @@
 #include "../fd_flamenco_base.h"
 #include "../types/fd_types.h"
 #include "../../ballet/lthash/fd_lthash.h"
-#include "fd_bank.h"
-#include "context/fd_capture_ctx.h"
 
 /* fd_hashes.h provides functions for computing and updating the bank hash
    for a completed slot.  The bank hash is a cryptographic hash of the
@@ -110,7 +108,7 @@ fd_hashes_update_lthash( fd_txn_account_t const  * account,
 */
 
 void
-fd_hashes_hash_bank( fd_slot_lthash_t const * lthash,
+fd_hashes_hash_bank( fd_lthash_value_t const * lthash,
                      fd_hash_t const *        prev_bank_hash,
                      fd_hash_t const *        last_blockhash,
                      ulong                    signature_count,

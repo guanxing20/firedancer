@@ -356,7 +356,7 @@ landed_votes_from_lockouts( fd_vote_lockout_t * lockouts,
   uchar * deque_mem = fd_spad_alloc( spad,
                                      deq_fd_landed_vote_t_align(),
                                      deq_fd_landed_vote_t_footprint( cnt ) );
-  fd_landed_vote_t * landed_votes = deq_fd_landed_vote_t_join( deq_fd_landed_vote_t_new( deque_mem, deq_fd_landed_vote_t_footprint( cnt ) ) );
+  fd_landed_vote_t * landed_votes = deq_fd_landed_vote_t_join( deq_fd_landed_vote_t_new( deque_mem, cnt ) );
 
   for( deq_fd_vote_lockout_t_iter_t iter = deq_fd_vote_lockout_t_iter_init( lockouts );
        !deq_fd_vote_lockout_t_iter_done( lockouts, iter );
@@ -586,45 +586,53 @@ credits_for_vote_at_index( fd_vote_state_t * self, ulong index ) {
   return credits;
 }
 
-// https://github.com/anza-xyz/agave/blob/v2.0.1/sdk/program/src/vote/state/mod.rs#L639
+/* https://github.com/anza-xyz/solana-sdk/blob/vote-interface%40v3.0.0/vote-interface/src/state/vote_state_v3.rs#L282-L309 */
 static void
 increment_credits( fd_vote_state_t * self, ulong epoch, ulong credits ) {
-  // https://github.com/anza-xyz/agave/blob/v2.0.1/sdk/program/src/vote/state/mod.rs#L643
+  /* https://github.com/anza-xyz/solana-sdk/blob/vote-interface%40v3.0.0/vote-interface/src/state/vote_state_v3.rs#L286-L305 */
   if( FD_UNLIKELY( deq_fd_vote_epoch_credits_t_empty( self->epoch_credits ) ) ) {
-    // https://github.com/anza-xyz/agave/blob/v2.0.1/sdk/program/src/vote/state/mod.rs#L644
+    /* https://github.com/anza-xyz/solana-sdk/blob/vote-interface%40v3.0.0/vote-interface/src/state/vote_state_v3.rs#L286-L288 */
     deq_fd_vote_epoch_credits_t_push_tail_wrap(
         self->epoch_credits,
         ( fd_vote_epoch_credits_t ){ .epoch = epoch, .credits = 0, .prev_credits = 0 } );
   } else if( FD_LIKELY( epoch !=
                         deq_fd_vote_epoch_credits_t_peek_tail( self->epoch_credits )->epoch ) ) {
+    /* https://github.com/anza-xyz/solana-sdk/blob/vote-interface%40v3.0.0/vote-interface/src/state/vote_state_v3.rs#L290 */
     fd_vote_epoch_credits_t * last = deq_fd_vote_epoch_credits_t_peek_tail( self->epoch_credits );
 
     ulong credits      = last->credits;
     ulong prev_credits = last->prev_credits;
 
-    // https://github.com/anza-xyz/agave/blob/v2.0.1/sdk/program/src/vote/state/mod.rs#L648
-    if( FD_LIKELY( credits != prev_credits ) ) {
-      /* Although Agave performs a `.remove(0)` AFTER the call to `.push()`, there is an edge case
-         where the epoch credits is full, making the call to `_push_tail()` unsafe. Since Agave's
-         structures are dynamically allocated, it is safe for them to simply call `.push()`
-         and then popping afterwards. We have to reverse the order of operations to maintain
-         correct behavior and avoid overflowing the deque.
-         https://github.com/anza-xyz/agave/blob/v2.0.1/sdk/program/src/vote/state/mod.rs#L658 */
-      if( FD_UNLIKELY( deq_fd_vote_epoch_credits_t_cnt( self->epoch_credits ) >=
-                        MAX_EPOCH_CREDITS_HISTORY ) ) {
+    /* https://github.com/anza-xyz/solana-sdk/blob/vote-interface%40v3.0.0/vote-interface/src/state/vote_state_v3.rs#L292-L299 */
+    if( FD_LIKELY( credits!=prev_credits ) ) {
+      if( FD_UNLIKELY( deq_fd_vote_epoch_credits_t_cnt( self->epoch_credits )>=MAX_EPOCH_CREDITS_HISTORY ) ) {
+        /* Although Agave performs a `.remove(0)` AFTER the call to
+          `.push()`, there is an edge case where the epoch credits is
+          full, making the call to `_push_tail()` unsafe. Since Agave's
+          structures are dynamically allocated, it is safe for them to
+          simply call `.push()` and then popping afterwards. We have to
+          reverse the order of operations to maintain correct behavior
+          and avoid overflowing the deque.
+          https://github.com/anza-xyz/solana-sdk/blob/vote-interface%40v3.0.0/vote-interface/src/state/vote_state_v3.rs#L303 */
         deq_fd_vote_epoch_credits_t_pop_head( self->epoch_credits );
       }
 
-      /* This will not fail because we already popped if we're at capacity,
-         since the epoch_credits deque is allocated with a minimum
-         capacity of MAX_EPOCH_CREDITS_HISTORY. */
+      /* This will not fail because we already popped if we're at
+         capacity, since the epoch_credits deque is allocated with a
+         minimum capacity of MAX_EPOCH_CREDITS_HISTORY. */
       deq_fd_vote_epoch_credits_t_push_tail(
           self->epoch_credits,
           ( fd_vote_epoch_credits_t ){
               .epoch = epoch, .credits = credits, .prev_credits = credits } );
     } else {
-      // https://github.com/anza-xyz/agave/blob/v2.0.1/sdk/program/src/vote/state/mod.rs#L654
+      /* https://github.com/anza-xyz/solana-sdk/blob/vote-interface%40v3.0.0/vote-interface/src/state/vote_state_v3.rs#L297-L298 */
       deq_fd_vote_epoch_credits_t_peek_tail( self->epoch_credits )->epoch = epoch;
+
+      /* Here we can perform the same deque size check and pop if
+         we're beyond the maximum epoch credits len. */
+      if( FD_UNLIKELY( deq_fd_vote_epoch_credits_t_cnt( self->epoch_credits )>MAX_EPOCH_CREDITS_HISTORY ) ) {
+        deq_fd_vote_epoch_credits_t_pop_head( self->epoch_credits );
+      }
     }
   }
 
@@ -879,7 +887,7 @@ check_and_filter_proposed_vote_state( fd_vote_state_t *           vote_state,
   if( FD_LIKELY( last_vote ) ) {
     if( FD_UNLIKELY( deq_fd_vote_lockout_t_peek_tail_const( proposed_lockouts )->slot <=
                      last_vote->lockout.slot ) ) {
-      ctx->txn_ctx->custom_err = FD_VOTE_ERROR_VOTE_TOO_OLD;
+      ctx->txn_ctx->custom_err = FD_VOTE_ERR_VOTE_TOO_OLD;
       return FD_EXECUTOR_INSTR_ERR_CUSTOM_ERR;
     }
   }
@@ -899,7 +907,7 @@ check_and_filter_proposed_vote_state( fd_vote_state_t *           vote_state,
   /* Check if the proposed vote is too old to be in the SlotHash history */
   // https://github.com/anza-xyz/agave/blob/v2.0.1/programs/vote/src/vote_state/mod.rs#L230
   if( FD_UNLIKELY( last_vote_state_update_slot < earliest_slot_hash_in_history ) ) {
-    ctx->txn_ctx->custom_err = FD_VOTE_ERROR_VOTE_TOO_OLD;
+    ctx->txn_ctx->custom_err = FD_VOTE_ERR_VOTE_TOO_OLD;
     return FD_EXECUTOR_INSTR_ERR_CUSTOM_ERR;
   }
 
@@ -1166,7 +1174,7 @@ check_slots_are_valid( fd_vote_state_t *        vote_state,
 
   // https://github.com/anza-xyz/agave/blob/v2.0.1/programs/vote/src/vote_state/mod.rs#L494
   if( FD_UNLIKELY( j == deq_fd_slot_hash_t_cnt( slot_hashes ) ) ) {
-    ctx->txn_ctx->custom_err = FD_VOTE_ERROR_VOTE_TOO_OLD;
+    ctx->txn_ctx->custom_err = FD_VOTE_ERR_VOTE_TOO_OLD;
     return FD_EXECUTOR_INSTR_ERR_CUSTOM_ERR;
   }
   if( FD_UNLIKELY( i != vote_slots_len ) ) {
@@ -1654,7 +1662,7 @@ withdraw( fd_exec_instr_ctx_t const *   ctx,
   }
 
   // https://github.com/anza-xyz/agave/blob/v2.0.1/programs/vote/src/vote_state/mod.rs#L1049
-  rc = fd_borrowed_account_checked_sub_lamports( vote_account, lamports);
+  rc = fd_borrowed_account_checked_sub_lamports( vote_account, lamports );
   if( FD_UNLIKELY( rc ) ) return rc;
 
   /* https://github.com/anza-xyz/agave/blob/v2.1.14/programs/vote/src/vote_state/mod.rs#L1019 */
@@ -1665,7 +1673,7 @@ withdraw( fd_exec_instr_ctx_t const *   ctx,
   FD_TRY_BORROW_INSTR_ACCOUNT_DEFAULT_ERR_CHECK( ctx, to_account_index, &to );
 
   // https://github.com/anza-xyz/agave/blob/v2.0.1/programs/vote/src/vote_state/mod.rs#L1053
-  rc = fd_borrowed_account_checked_add_lamports( &to, lamports);
+  rc = fd_borrowed_account_checked_add_lamports( &to, lamports );
   if( FD_UNLIKELY( rc ) ) return rc;
 
   return 0;
@@ -1922,36 +1930,41 @@ process_vote_state_update( fd_borrowed_account_t *       vote_account,
                            fd_exec_instr_ctx_t const *   ctx /* feature_set */ ) {
   int rc;
 
-  // tie in code for fd_bank_hash_cmp that helps us detect if we have forked from the cluster.
-  //
-  // There is no corresponding code in anza
+  /* A temporary hack to accumulate the stake-weighted bank hash from
+     all vote transactions.  This determines whether our validator has
+     bank hash mismatched.  TODO: move to a tile. */
+  if( FD_LIKELY( !!ctx->txn_ctx->bank_hash_cmp ) ) {
+    // tie in code for fd_bank_hash_cmp that helps us detect if we have forked from the cluster.
+    //
+    // There is no corresponding code in anza
 
-  fd_vote_states_t const * vote_states = fd_bank_vote_states_locking_query( ctx->txn_ctx->bank );
-  if( !vote_states ) {
-    FD_LOG_CRIT(( "vote_states is NULL" ));
-  }
-
-  fd_vote_state_ele_t * vote_state_ele = fd_vote_states_query( vote_states, vote_account->acct->pubkey );
-  if( !vote_state_ele ) {
-    FD_LOG_CRIT(( "vote_state is NULL" ));
-  }
-
-  if( !deq_fd_vote_lockout_t_empty( vote_state_update->lockouts ) ) {
-    fd_vote_lockout_t *  lockout       = deq_fd_vote_lockout_t_peek_tail( vote_state_update->lockouts );
-    fd_bank_hash_cmp_t * bank_hash_cmp = ctx->txn_ctx->bank_hash_cmp;
-    if( FD_LIKELY( lockout && bank_hash_cmp ) ) {
-      fd_bank_hash_cmp_lock( bank_hash_cmp );
-      fd_bank_hash_cmp_insert(
-        bank_hash_cmp,
-          lockout->slot,
-          &vote_state_update->hash,
-          0,
-          vote_state_ele->stake );
-      fd_bank_hash_cmp_unlock( bank_hash_cmp );
+    fd_vote_states_t const * vote_states = fd_bank_vote_states_locking_query( ctx->txn_ctx->bank );
+    if( !vote_states ) {
+      FD_LOG_CRIT(( "vote_states is NULL" ));
     }
-  }
 
-  fd_bank_vote_states_end_locking_query( ctx->txn_ctx->bank );
+    fd_vote_state_ele_t const * vote_state_ele = fd_vote_states_query_const( vote_states, vote_account->acct->pubkey );
+    if( !vote_state_ele ) {
+      FD_LOG_CRIT(( "vote_state is NULL" ));
+    }
+
+    if( !deq_fd_vote_lockout_t_empty( vote_state_update->lockouts ) ) {
+      fd_vote_lockout_t *  lockout       = deq_fd_vote_lockout_t_peek_tail( vote_state_update->lockouts );
+      fd_bank_hash_cmp_t * bank_hash_cmp = ctx->txn_ctx->bank_hash_cmp;
+      if( FD_LIKELY( lockout && bank_hash_cmp ) ) {
+        fd_bank_hash_cmp_lock( bank_hash_cmp );
+        fd_bank_hash_cmp_insert(
+          bank_hash_cmp,
+            lockout->slot,
+            &vote_state_update->hash,
+            0,
+            vote_state_ele->stake );
+        fd_bank_hash_cmp_unlock( bank_hash_cmp );
+      }
+    }
+
+    fd_bank_vote_states_end_locking_query( ctx->txn_ctx->bank );
+  }
 
   fd_vote_state_t vote_state;
   // https://github.com/anza-xyz/agave/blob/v2.0.1/programs/vote/src/vote_state/mod.rs#L1144
@@ -2016,26 +2029,30 @@ process_tower_sync( fd_borrowed_account_t *       vote_account,
                     fd_tower_sync_t *             tower_sync,
                     fd_pubkey_t const *           signers[static FD_TXN_SIG_MAX],
                     fd_exec_instr_ctx_t const *   ctx /* feature_set */ ) {
-
-  if( !deq_fd_vote_lockout_t_empty( tower_sync->lockouts ) ) {
-    fd_vote_lockout_t *  lockout       = deq_fd_vote_lockout_t_peek_tail( tower_sync->lockouts );
-    fd_bank_hash_cmp_t * bank_hash_cmp = ctx->txn_ctx->bank_hash_cmp;
-    fd_vote_states_t const * vote_states = fd_bank_vote_states_locking_query( ctx->txn_ctx->bank );
-    if( !vote_states ) {
-      FD_LOG_CRIT(( "vote_states is NULL" ));
+  /* A temporary hack to accumulate the stake-weighted bank hash from
+     all vote transactions.  This determines whether our validator has
+     bank hash mismatched.  TODO: move to a tile. */
+  if( FD_LIKELY( !!ctx->txn_ctx->bank_hash_cmp ) ) {
+    if( !deq_fd_vote_lockout_t_empty( tower_sync->lockouts ) ) {
+      fd_vote_lockout_t *  lockout       = deq_fd_vote_lockout_t_peek_tail( tower_sync->lockouts );
+      fd_bank_hash_cmp_t * bank_hash_cmp = ctx->txn_ctx->bank_hash_cmp;
+      fd_vote_states_t const * vote_states = fd_bank_vote_states_locking_query( ctx->txn_ctx->bank );
+      if( !vote_states ) {
+        FD_LOG_CRIT(( "vote_states is NULL" ));
+      }
+      fd_vote_state_ele_t const * vote_state_ele = fd_vote_states_query_const( vote_states, vote_account->acct->pubkey );
+      if( FD_LIKELY( lockout && bank_hash_cmp && vote_state_ele ) ) {
+        fd_bank_hash_cmp_lock( bank_hash_cmp );
+        fd_bank_hash_cmp_insert(
+            bank_hash_cmp,
+            lockout->slot,
+            &tower_sync->hash,
+            0,
+            vote_state_ele->stake );
+        fd_bank_hash_cmp_unlock( bank_hash_cmp );
+      }
+      fd_bank_vote_states_end_locking_query( ctx->txn_ctx->bank );
     }
-    fd_vote_state_ele_t * vote_state_ele = fd_vote_states_query( vote_states, vote_account->acct->pubkey );
-    if( FD_LIKELY( lockout && bank_hash_cmp && vote_state_ele ) ) {
-      fd_bank_hash_cmp_lock( bank_hash_cmp );
-      fd_bank_hash_cmp_insert(
-          bank_hash_cmp,
-          lockout->slot,
-          &tower_sync->hash,
-          0,
-          vote_state_ele->stake );
-      fd_bank_hash_cmp_unlock( bank_hash_cmp );
-    }
-    fd_bank_vote_states_end_locking_query( ctx->txn_ctx->bank );
   }
 
   // https://github.com/anza-xyz/agave/blob/v2.0.1/programs/vote/src/vote_state/mod.rs#L1194

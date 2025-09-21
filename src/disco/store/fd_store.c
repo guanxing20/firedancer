@@ -47,14 +47,14 @@ fd_store_new( void * shmem, ulong fec_max, ulong part_cnt ) {
   ulong part_slot_cnt = fec_max / part_cnt;
   ulong seed          = part_slot_cnt;
 
-  fd_memset( shmem, 0, footprint );
   FD_SCRATCH_ALLOC_INIT( l, shmem );
-  fd_store_t * store  = FD_SCRATCH_ALLOC_APPEND( l, fd_store_align(),        sizeof( fd_store_t )               );
+  fd_store_t * store  = FD_SCRATCH_ALLOC_APPEND( l, fd_store_align(),        sizeof(fd_store_t)                 );
   void *       map    = FD_SCRATCH_ALLOC_APPEND( l, fd_store_map_align(),    fd_store_map_footprint ( fec_max ) );
   void *       shpool = FD_SCRATCH_ALLOC_APPEND( l, fd_store_pool_align(),   fd_store_pool_footprint()          );
   void *       shele  = FD_SCRATCH_ALLOC_APPEND( l, alignof(fd_store_fec_t), sizeof(fd_store_fec_t)*fec_max     );
   FD_TEST( FD_SCRATCH_ALLOC_FINI( l, fd_store_align() ) == (ulong)shmem + footprint );
 
+  fd_memset( store, 0, sizeof(fd_store_t) );
   store->store_gaddr    = fd_wksp_gaddr_fast( wksp, store  );
   store->pool_mem_gaddr = fd_wksp_gaddr_fast( wksp, shpool );
   store->pool_ele_gaddr = fd_wksp_gaddr_fast( wksp, shele  );
@@ -198,8 +198,8 @@ fd_store_link( fd_store_t * store, fd_hash_t * merkle_root, fd_hash_t * chained_
 }
 
 fd_store_fec_t *
-fd_store_publish( fd_store_t  * store,
-                  fd_hash_t   * merkle_root ) {
+fd_store_publish( fd_store_t *      store,
+                  fd_hash_t const * merkle_root ) {
 
 # if FD_STORE_USE_HANDHOLDING
   if( FD_UNLIKELY( !fd_store_query( store, merkle_root ) ) ) { FD_LOG_WARNING(( "merkle root %s not found", FD_BASE58_ENC_32_ALLOCA( merkle_root ) )); return NULL; }

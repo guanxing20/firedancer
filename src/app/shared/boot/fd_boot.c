@@ -67,7 +67,7 @@ should_colorize( void ) {
   if( cstr && !strcmp( cstr, "truecolor" ) ) return 1;
 
   cstr = fd_env_strip_cmdline_cstr( NULL, NULL, NULL, "TERM", NULL );
-  if( cstr && !strcmp( cstr, "xterm-256color" ) ) return 1;
+  if( cstr && strstr( cstr, "256color" ) ) return 1;
   return 0;
 }
 
@@ -148,8 +148,6 @@ fd_main_init( int *                      pargc,
        they can coordinate on metrics measurement. */
     fd_tempo_set_tick_per_ns( config->tick_per_ns_mu, config->tick_per_ns_sigma );
   } else {
-    config->boot_timesamp_nanos = fd_log_wallclock();
-
     char * user_config = NULL;
     ulong user_config_sz = 0UL;
     if( FD_LIKELY( opt_user_config_path ) ) {

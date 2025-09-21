@@ -48,8 +48,16 @@ union fd_signature {
   uchar uc[ 64 ];
   ulong ul[  8 ];
 };
-
 typedef union fd_signature fd_signature_t;
+
+
+FD_FN_PURE
+static inline int
+fd_signature_eq( fd_signature_t const * a,
+                 fd_signature_t const * b ) {
+  return 0==memcmp( a, b, sizeof(fd_signature_t) );
+}
+
 
 FD_PROTOTYPES_BEGIN
 
@@ -195,9 +203,6 @@ fd_flamenco_txn_decode( void * mem, fd_bincode_decode_ctx_t * ctx );
 
 void
 fd_flamenco_txn_decode_inner( void * struct_mem, void * * alloc_mem, fd_bincode_decode_ctx_t * ctx );
-
-/* Represents the lamport balance associated with an account. */
-typedef ulong fd_acc_lamports_t;
 
 typedef struct fd_rust_duration fd_rust_duration_t;
 

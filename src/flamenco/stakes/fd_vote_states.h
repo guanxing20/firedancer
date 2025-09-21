@@ -5,7 +5,7 @@
 #include "../../util/tmpl/fd_map.h"
 #include "../types/fd_types_custom.h"
 
-#define FD_VOTE_STATES_MAGIC (0xF17EDA2CE7601E70) /* FIREDANCER VOTER V0 */
+#define FD_VOTE_STATES_MAGIC (0xF17EDA2CE7601E70UL) /* FIREDANCER VOTER V0 */
 
 /* fd_vote_states_t is a cache of vote accounts mapping the pubkey of
    a vote account to various infromation about the vote account
@@ -163,7 +163,8 @@ fd_vote_states_update( fd_vote_states_t *  vote_states,
    corresponding to a valid vote account. This is the same as
    fd_vote_states_update but is also responsible for decoding the vote
    account data into a versioned vote state object and extracing the
-   commission and credits. */
+   commission and credits. Kills the client if the vote state cannot
+   be decoded. */
 
 void
 fd_vote_states_update_from_account( fd_vote_states_t *  vote_states,
@@ -193,7 +194,9 @@ fd_vote_states_remove( fd_vote_states_t *  vote_states,
                        fd_pubkey_t const * vote_account );
 
 /* fd_vote_states_query returns the vote state corresponding to a given
-   account. Returns NULL if the account does not exist. */
+   account. Returns NULL if the account does not exist. This function is
+   safe for concurrent reads, but the caller needs to synchronize
+   concurrent writers to the fd_vote_state_ele_t. */
 
 fd_vote_state_ele_t *
 fd_vote_states_query( fd_vote_states_t const * vote_states,
@@ -234,8 +237,8 @@ fd_vote_states_cnt( fd_vote_states_t const * vote_states );
 
    Example use:
 
-   uchar mem[FD_VOTE_STATE_ITER_FOOTPRINT];
-   for( fd_vote_states_iter_t * iter = fd_vote_states_iter_init( vote_states, mem ); !fd_vote_states_iter_done( iter ); fd_vote_states_iter_next( iter ) ) {
+   fd_vote_states_iter_t iter_[1];
+   for( fd_vote_states_iter_t * iter = fd_vote_states_iter_init( vote_states, iter_ ); !fd_vote_states_iter_done( iter ); fd_vote_states_iter_next( iter ) ) {
      fd_vote_state_ele_t * vote_state = fd_vote_states_iter_ele( iter );
      // Do something with the vote state ...
    }

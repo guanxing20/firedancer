@@ -1,10 +1,11 @@
 #ifndef HEADER_fd_src_flamenco_stakes_fd_stake_delegations_h
 #define HEADER_fd_src_flamenco_stakes_fd_stake_delegations_h
 
-#include "../fd_flamenco_base.h"
-#include "../types/fd_types.h"
+#include "../rewards/fd_rewards_base.h"
+#include "../runtime/fd_cost_tracker.h"
+#include "../../util/tmpl/fd_map.h"
 
-#define FD_STAKE_DELEGATIONS_MAGIC (0x0915199511111111UL)
+#define FD_STAKE_DELEGATIONS_MAGIC (0xF17EDA2CE757A3E0) /* FIREDANCER STAKE V0 */
 
 /* fd_stakes_delegations_t is a cache of stake accounts mapping the
    pubkey of the stake account to various information including
@@ -27,6 +28,14 @@
    by the bank. The stake delegations corresponding to each slot are
    stored in a delta struct which is used to update the main cache.
 
+   There are some important invariants wrt fd_stake_delegations_t:
+   1. After execution has started, there will be no invalid stake
+      accounts in the stake delegations struct.
+   2. The stake delegations struct can have valid delegations for vote
+      accounts which no longer exist.
+   3. There are no stake accounts which are valid delegations which
+      exist in the accounts database but not in fd_stake_delegations_t.
+
    In practice, fd_stakes_delegations_t are updated in 3 cases:
    1. During bootup when the snapshot manifest is loaded in. The cache
       is also refreshed during the bootup process to ensure that the
@@ -48,6 +57,48 @@
       case, the cache is updated to reflect each stake account post
       reward distribution.
    The stake accounts are read-only during the epoch boundary. */
+
+/* The max number of stake accounts that can be modified in a current
+   slot from transactions can be bounded based on CU consumption. The
+   best strategy to maximize the max number of stake accounts modified
+   in a single transaction.  A stake program instruction can either
+   modify one or two stake accounts.  Stake program instructions that
+   modify two stake accounts (merge/split) are assumed to be at least 2x
+   as expensive as a stake program instruction that modifies one stake
+   account.  So we will assume that the most efficient strategy is to
+   modify one stake account per instruction and have as many instruction
+   as posssible in this transaction.  We can have 63 stake program
+   instructions in this transaction because one account will be the fee
+   payer/signature and the other 63 are free to be writable accounts.
+
+   Given the above:
+   100000000 - CUs per slot
+   64 - Max number of writable accounts per transaction.
+   63 - Max number of writable stake accounts per transaction.
+   720 - Cost of a signature
+   300 - Cost of a writable account lock.
+   6000 - Cost of a stake program instruction.
+
+   We can have (100000000 / (720 + 300 * 64 + 6000 * 63)) = 251
+   optimal stake program transactions per slot.  With 63 stake accounts
+   per transaction, we can have 251 * 63 = 15813 stake accounts modified
+   in a slot. */
+
+#define MAX_OPTIMAL_STAKE_ACCOUNTS_POSSIBLE_IN_TXN (FD_MAX_BLOCK_UNITS_SIMD_0286/(FD_WRITE_LOCK_UNITS * FD_RUNTIME_MAX_WRITABLE_ACCOUNTS_PER_TRANSACTION + FD_RUNTIME_MIN_STAKE_INSN_CUS * (FD_RUNTIME_MAX_WRITABLE_ACCOUNTS_PER_TRANSACTION - 1UL) + FD_PACK_COST_PER_SIGNATURE))
+FD_STATIC_ASSERT(MAX_OPTIMAL_STAKE_ACCOUNTS_POSSIBLE_IN_TXN==251, "Incorrect MAX_STAKE_ACCOUNTS_POSSIBLE_IN_TXN");
+#define MAX_STAKE_ACCOUNTS_POSSIBLE_IN_SLOT_FROM_TXNS (MAX_OPTIMAL_STAKE_ACCOUNTS_POSSIBLE_IN_TXN * (FD_RUNTIME_MAX_WRITABLE_ACCOUNTS_PER_TRANSACTION - 1UL))
+FD_STATIC_ASSERT(MAX_STAKE_ACCOUNTS_POSSIBLE_IN_SLOT_FROM_TXNS==15813, "Incorrect MAX_STAKE_ACCOUNTS_PER_SLOT");
+
+/* The static footprint of fd_stake_delegations_t when it is a delta
+   is determined by the max total number of stake accounts that can get
+   changed in a single slot. Stake accounts can get modified in two ways:
+   1. Through transactions. This bound is calculated using CU
+      consumption as described above.
+   2. Through epoch rewards. This is a protocol-level bound is defined
+      in fd_rewards_base.h and is the max number of stake accounts that
+      can reside in a single reward partition. */
+
+#define FD_STAKE_DELEGATIONS_MAX_PER_SLOT (MAX_STAKE_ACCOUNTS_POSSIBLE_IN_SLOT_FROM_TXNS + STAKE_ACCOUNT_STORES_PER_BLOCK)
 
 /* The static footprint of the vote states assumes that there are
    FD_RUNTIME_MAX_STAKE_ACCOUNTS. It also assumes worst case alignment
@@ -76,15 +127,15 @@
    can be added in a single slot. We know that there can be up to
    8192 writable accounts in a slot (bound determined from the cost
    tracker). Using the same calculation as above, we get 120 bytes per
-   stake delegation with up to 8192 delegations we have a total
-   footprint of ~1MB. */
+   stake delegation with up to ~19K delegations we have a total
+   footprint of ~2.5MB. */
 
-#define FD_STAKE_DELEGATIONS_DELTA_CHAIN_CNT_EST (4096UL)
+#define FD_STAKE_DELEGATIONS_DELTA_CHAIN_CNT_EST (16384UL)
 #define FD_STAKE_DELEGATIONS_DELTA_FOOTPRINT                                                       \
   /* First, layout the struct with alignment */                                                    \
   sizeof(fd_stake_delegations_t) + alignof(fd_stake_delegations_t) +                               \
   /* Now layout the pool's data footprint */                                                       \
-  FD_STAKE_DELEGATIONS_ALIGN + sizeof(fd_stake_delegation_t) * FD_RUNTIME_MAX_STAKE_ACCS_IN_SLOT + \
+  FD_STAKE_DELEGATIONS_ALIGN + sizeof(fd_stake_delegation_t) * FD_STAKE_DELEGATIONS_MAX_PER_SLOT + \
   /* Now layout the pool's meta footprint */                                                       \
   FD_STAKE_DELEGATIONS_ALIGN + 128UL /* POOL_ALIGN */ +                                            \
   /* Now layout the map.  We must make assumptions about the chain */                              \
@@ -106,42 +157,31 @@ struct fd_stake_delegation {
 };
 typedef struct fd_stake_delegation fd_stake_delegation_t;
 
-#define POOL_NAME fd_stake_delegation_pool
-#define POOL_T    fd_stake_delegation_t
-#define POOL_NEXT next_
-#include "../../util/tmpl/fd_pool.c"
-
-/* TODO: replace fd_hash with the more performant fd_funk_rec_key_hash1 */
-
-#define MAP_NAME               fd_stake_delegation_map
-#define MAP_KEY_T              fd_pubkey_t
-#define MAP_ELE_T              fd_stake_delegation_t
-#define MAP_KEY                stake_account
-#define MAP_KEY_EQ(k0,k1)      (!(memcmp(&(k0)->key,&(k1)->key,sizeof(fd_pubkey_t))))
-#define MAP_KEY_HASH(key,seed) (fd_hash( seed, key, sizeof(fd_pubkey_t) ))
-#define MAP_NEXT               next_
-#include "../../util/tmpl/fd_map_chain.c"
-
 struct fd_stake_delegations {
   ulong magic;
-  ulong max_stake_accounts;
-  int   leave_tombstones;
+  ulong map_offset_;
+  ulong pool_offset_;
+  ulong max_stake_accounts_;
+  int   leave_tombstones_;
 };
 typedef struct fd_stake_delegations fd_stake_delegations_t;
 
+/* Forward declare map iterator API generated by fd_map_chain.c */
+typedef struct fd_stake_delegation_map_private fd_stake_delegation_map_t;
+typedef struct fd_map_chain_iter fd_stake_delegation_map_iter_t;
+struct fd_stake_delegations_iter {
+  fd_stake_delegation_map_t *    map;
+  fd_stake_delegation_t *        pool;
+  fd_stake_delegation_map_iter_t iter;
+};
+typedef struct fd_stake_delegations_iter fd_stake_delegations_iter_t;
+
+struct fd_funk_private;
+typedef struct fd_funk_private fd_funk_t;
+struct fd_funk_txn_private;
+typedef struct fd_funk_txn_private fd_funk_txn_t;
+
 FD_PROTOTYPES_BEGIN
-
-/* fd_stake_delegations_get_pool returns the underlying pool that the
-   stake delegations uses to manage the stake delegations. */
-
-fd_stake_delegation_t *
-fd_stake_delegations_get_pool( fd_stake_delegations_t const * stake_delegations );
-
-/* fd_stake_delegations_get_map returns the underlying map that the
-   stake delegations uses to manage the stake delegations. */
-
-fd_stake_delegation_map_t *
-fd_stake_delegations_get_map( fd_stake_delegations_t const * stake_delegations );
 
 /* fd_stake_delegations_align returns the alignment of the stake
    delegations struct. */
@@ -223,36 +263,34 @@ fd_stake_delegations_remove( fd_stake_delegations_t * stake_delegations,
    stake account's pubkey if one exists. If one does not exist, returns
    NULL. fd_stake_delegations_t must be a valid local join. */
 
-static inline fd_stake_delegation_t const *
+fd_stake_delegation_t const *
 fd_stake_delegations_query( fd_stake_delegations_t const * stake_delegations,
-                            fd_pubkey_t const *            stake_account ) {
+                            fd_pubkey_t const *            stake_account );
 
-  if( FD_UNLIKELY( !stake_delegations ) ) {
-    FD_LOG_CRIT(( "NULL stake_delegations" ));
-    return NULL;
-  }
+/* fd_stake_delegations_refresh is used to refresh the stake
+   delegations stored in fd_stake_delegations_t which is owned by
+   the bank. For a given database handle, read in the state of all
+   stake accounts, decode their state, and update each stake delegation.
+   This is meant to be called before any slots are executed, but after
+   the snapshot has finished loading.
 
-  if( FD_UNLIKELY( !stake_account ) ) {
-    FD_LOG_CRIT(( "NULL stake_account" ));
-    return NULL;
-  }
+   Before this function is called, there are some important assumptions
+   made about the state of the stake delegations that are enforced by
+   the Agave client:
+   1. fd_stake_delegations_t is not missing any valid entries
+   2. fd_stake_delegations_t may have some invalid entries that should
+      be removed
 
-  fd_stake_delegation_t const * stake_delegation_pool = fd_stake_delegations_get_pool( stake_delegations );
-  if( FD_UNLIKELY( !stake_delegation_pool ) ) {
-    FD_LOG_CRIT(( "unable to retrieve join to stake delegation pool" ));
-  }
+   fd_stake_delegations_refresh will remove all of the invalid entries
+   that are detected. An entry is considered invalid if the stake
+   account does not exist (e.g. zero balance or no record) or if it
+   has invalid state (e.g. not a stake account or invalid bincode data).
+   No new entries are added to the struct at this point. */
 
-  fd_stake_delegation_map_t const * stake_delegation_map = fd_stake_delegations_get_map( stake_delegations );
-  if( FD_UNLIKELY( !stake_delegation_map ) ) {
-    FD_LOG_CRIT(( "unable to retrieve join to stake delegation map" ));
-  }
-
-  return fd_stake_delegation_map_ele_query_const(
-      stake_delegation_map,
-      stake_account,
-      NULL,
-      stake_delegation_pool );
-}
+void
+fd_stake_delegations_refresh( fd_stake_delegations_t * stake_delegations,
+                              fd_funk_t *              funk,
+                              fd_funk_txn_t *          funk_txn );
 
 /* fd_stake_delegations_cnt returns the number of stake delegations
    in the stake delegations struct. fd_stake_delegations_t must be a
@@ -262,19 +300,8 @@ fd_stake_delegations_query( fd_stake_delegations_t const * stake_delegations,
    in the underlying map. This number includes tombstones if the
    leave_tombstones flag is set. */
 
-static inline ulong
-fd_stake_delegations_cnt( fd_stake_delegations_t const * stake_delegations ) {
-  if( FD_UNLIKELY( !stake_delegations ) ) {
-    FD_LOG_CRIT(( "NULL stake_delegations" ));
-  }
-
-  fd_stake_delegation_t const * stake_delegation_pool = fd_stake_delegations_get_pool( stake_delegations );
-  if( FD_UNLIKELY( !stake_delegation_pool ) ) {
-    FD_LOG_CRIT(( "unable to retrieve join to stake delegation map" ));
-  }
-
-  return fd_stake_delegation_pool_used( stake_delegation_pool );
-}
+ulong
+fd_stake_delegations_cnt( fd_stake_delegations_t const * stake_delegations );
 
 static inline ulong
 fd_stake_delegations_max( fd_stake_delegations_t const * stake_delegations ) {
@@ -282,8 +309,45 @@ fd_stake_delegations_max( fd_stake_delegations_t const * stake_delegations ) {
     FD_LOG_CRIT(( "NULL stake_delegations" ));
   }
 
-  return stake_delegations->max_stake_accounts;
+  return stake_delegations->max_stake_accounts_;
 }
+
+/* Iterator API for stake delegations. The iterator is initialized with
+   a call to fd_stake_delegations_iter_init. The caller is responsible
+   for managing the memory for the iterator. It is safe to call
+   fd_stake_delegations_iter_next if the result of
+   fd_stake_delegations_iter_done() ==0. It is safe to call
+   fd_stake_delegations_iter_ele() to get the current stake delegation.
+   As a note, it is safe to modify the stake delegation acquired from
+   fd_stake_delegations_iter_ele() as long as the next_ field is not
+   modified (which the caller should never do). It is unsafe to insert
+   or remove fd_stake_delegation_t from the stake delegations struct
+   while iterating.
+
+   Under the hood, the iterator is just a wrapper over the iterator in
+   fd_map_chain.c.
+
+   Example use:
+
+   fd_stake_delegations_iter_t iter_[1];
+   for( fd_stake_delegations_iter_t * iter = fd_stake_delegations_iter_init( iter_, stake_delegations ); !fd_stake_delegations_iter_done( iter ); fd_stake_delegations_iter_next( iter ) ) {
+     fd_stake_delegation_t * stake_delegation = fd_stake_delegations_iter_ele( iter );
+     // Do something with the stake delegation ...
+   }
+*/
+
+fd_stake_delegation_t *
+fd_stake_delegations_iter_ele( fd_stake_delegations_iter_t * iter );
+
+fd_stake_delegations_iter_t *
+fd_stake_delegations_iter_init( fd_stake_delegations_iter_t *  iter,
+                                fd_stake_delegations_t const * stake_delegations );
+
+void
+fd_stake_delegations_iter_next( fd_stake_delegations_iter_t * iter );
+
+int
+fd_stake_delegations_iter_done( fd_stake_delegations_iter_t * iter );
 
 FD_PROTOTYPES_END
 

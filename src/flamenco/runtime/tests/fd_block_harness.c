@@ -14,6 +14,7 @@
 #include "../../rewards/fd_rewards.h"
 #include "../../stakes/fd_stakes.h"
 #include "../../types/fd_types.h"
+#include "../../../disco/pack/fd_pack.h"
 #include "generated/block.pb.h"
 
 /* Stripped down version of `fd_refresh_vote_accounts()` that simply refreshes the stake delegation amount
@@ -21,19 +22,20 @@
 static void
 fd_runtime_fuzz_block_refresh_vote_accounts( fd_vote_states_t *       vote_states,
                                              fd_stake_delegations_t * stake_delegations ) {
-  fd_stake_delegation_map_t * map  = fd_stake_delegations_get_map( stake_delegations );
-  fd_stake_delegation_t *     pool = fd_stake_delegations_get_pool( stake_delegations );
-
-  for( fd_stake_delegation_map_iter_t iter = fd_stake_delegation_map_iter_init( map, pool );
-       !fd_stake_delegation_map_iter_done( iter, map, pool );
-       iter = fd_stake_delegation_map_iter_next( iter, map, pool ) ) {
-    fd_stake_delegation_t * node = fd_stake_delegation_map_iter_ele( iter, map, pool );
+  fd_stake_delegations_iter_t iter_[1];
+  for( fd_stake_delegations_iter_t * iter = fd_stake_delegations_iter_init( iter_, stake_delegations );
+       !fd_stake_delegations_iter_done( iter );
+       fd_stake_delegations_iter_next( iter ) ) {
+    fd_stake_delegation_t * node = fd_stake_delegations_iter_ele( iter );
 
     fd_pubkey_t * voter_pubkey = &node->vote_account;
     ulong         stake        = node->stake;
 
-    /* Find the voter in the vote accounts cache and update their delegation amount */
+    /* Find the voter in the vote accounts cache and update their
+       delegation amount */
     fd_vote_state_ele_t * vote_state = fd_vote_states_query( vote_states, voter_pubkey );
+    if( !vote_state ) continue;
+
     ulong vote_stake = vote_state->stake;
     fd_vote_states_update_stake( vote_states, voter_pubkey, vote_stake + stake );
 
@@ -130,18 +132,30 @@ fd_runtime_fuzz_block_register_stake_delegation( fd_exec_slot_ctx_t *     slot_c
 static void
 fd_runtime_fuzz_block_update_prev_epoch_votes_cache( fd_vote_states_t *            vote_states,
                                                      fd_exec_test_vote_account_t * vote_accounts,
-                                                     pb_size_t                     vote_accounts_cnt ) {
-  for( uint i=0U; i<vote_accounts_cnt; i++ ) {
-    fd_exec_test_acct_state_t * vote_account  = &vote_accounts[i].vote_account;
-    ulong                       stake         = vote_accounts[i].stake;
-    uchar *                     vote_data     = vote_account->data->bytes;
-    ulong                       vote_data_len = vote_account->data->size;
-    fd_pubkey_t                 vote_address  = {0};
-    fd_memcpy( &vote_address, vote_account->address, sizeof(fd_pubkey_t) );
+                                                     pb_size_t                     vote_accounts_cnt,
+                                                     fd_spad_t *                   spad ) {
+  FD_SPAD_FRAME_BEGIN( spad ) {
+    for( uint i=0U; i<vote_accounts_cnt; i++ ) {
+      fd_exec_test_acct_state_t * vote_account  = &vote_accounts[i].vote_account;
+      ulong                       stake         = vote_accounts[i].stake;
+      uchar *                     vote_data     = vote_account->data->bytes;
+      ulong                       vote_data_len = vote_account->data->size;
+      fd_pubkey_t                 vote_address  = {0};
+      fd_memcpy( &vote_address, vote_account->address, sizeof(fd_pubkey_t) );
 
-    fd_vote_states_update_from_account( vote_states, &vote_address, vote_data, vote_data_len );
-    fd_vote_states_update_stake( vote_states, &vote_address, stake );
-  }
+      /* Try decoding the vote state from the account data. If it isn't
+         decodable, don't try inserting it into the cache. */
+      fd_vote_state_versioned_t * res = fd_bincode_decode_spad(
+          vote_state_versioned, spad,
+          vote_data,
+          vote_data_len,
+          NULL );
+      if( res==NULL ) continue;
+
+      fd_vote_states_update_from_account( vote_states, &vote_address, vote_data, vote_data_len );
+      fd_vote_states_update_stake( vote_states, &vote_address, stake );
+    }
+  } FD_SPAD_FRAME_END;
 }
 
 static void
@@ -180,21 +194,20 @@ fd_runtime_fuzz_block_ctx_create( fd_solfuzz_runner_t *                runner,
   /* Set up slot context */
   ulong slot = test_ctx->slot_ctx.slot;
 
-  slot_ctx->funk_txn  = funk_txn;
-  slot_ctx->funk      = funk;
-  runner->bank->slot_ = slot;
-  slot_ctx->silent    = 1;
+  slot_ctx->funk_txn = funk_txn;
+  slot_ctx->funk     = funk;
+  slot_ctx->silent   = 1;
 
   fd_hash_t * bank_hash = fd_bank_bank_hash_modify( slot_ctx->bank );
   fd_memcpy( bank_hash, test_ctx->slot_ctx.parent_bank_hash, sizeof(fd_hash_t) );
 
   /* All bank mgr stuff here. */
 
-  slot_ctx->bank->slot_ = slot;
+  slot_ctx->bank->eslot_ = fd_eslot( slot, 0UL );
 
   fd_bank_block_height_set( slot_ctx->bank, test_ctx->slot_ctx.block_height );
 
-  fd_bank_parent_slot_set( slot_ctx->bank, test_ctx->slot_ctx.prev_slot );
+  fd_bank_parent_eslot_set( slot_ctx->bank, fd_eslot( test_ctx->slot_ctx.prev_slot, 0UL ) );
 
   fd_bank_capitalization_set( slot_ctx->bank, test_ctx->slot_ctx.prev_epoch_capitalization );
 
@@ -296,14 +309,16 @@ fd_runtime_fuzz_block_ctx_create( fd_solfuzz_runner_t *                runner,
   vote_states_prev = fd_bank_vote_states_prev_locking_modify( slot_ctx->bank );
   fd_runtime_fuzz_block_update_prev_epoch_votes_cache( vote_states_prev,
                                                        test_ctx->epoch_ctx.vote_accounts_t_1,
-                                                       test_ctx->epoch_ctx.vote_accounts_t_1_count );
+                                                       test_ctx->epoch_ctx.vote_accounts_t_1_count,
+                                                       runner->spad );
   fd_bank_vote_states_prev_end_locking_modify( slot_ctx->bank );
 
   /* Update vote cache for epoch T-2 */
   vote_states_prev_prev = fd_bank_vote_states_prev_prev_locking_modify( slot_ctx->bank );
   fd_runtime_fuzz_block_update_prev_epoch_votes_cache( vote_states_prev_prev,
                                                        test_ctx->epoch_ctx.vote_accounts_t_2,
-                                                       test_ctx->epoch_ctx.vote_accounts_t_2_count );
+                                                       test_ctx->epoch_ctx.vote_accounts_t_2_count,
+                                                       runner->spad );
   fd_bank_vote_states_prev_prev_end_locking_modify( slot_ctx->bank );
 
   /* Update leader schedule */
@@ -339,7 +354,7 @@ fd_runtime_fuzz_block_ctx_create( fd_solfuzz_runner_t *                runner,
   fd_funk_txn_end_write( funk );
 
   /* Reset the lthash to zero, because we are in a new Funk transaction now */
-  fd_slot_lthash_t lthash = {0};
+  fd_lthash_value_t lthash = {0};
   fd_bank_lthash_set( slot_ctx->bank, lthash );
 
   // Populate blockhash queue and recent blockhashes sysvar
@@ -433,18 +448,16 @@ fd_runtime_fuzz_block_ctx_exec( fd_solfuzz_runner_t *      runner,
   // Prepare. Execute. Finalize.
   FD_SPAD_FRAME_BEGIN( runner->spad ) {
     fd_capture_ctx_t * capture_ctx = NULL;
-    fd_capture_ctx_t capture_ctx_[1];
     if( runner->solcap ) {
-      capture_ctx_[0] = (fd_capture_ctx_t) {
-        .capture            = runner->solcap,
-        .capture_txns       = 1,
-        .dump_instr_to_pb   = 1,
-        .dump_txn_to_pb     = 1,
-        .dump_block_to_pb   = 1,
-        .dump_syscall_to_pb = 1,
-        .dump_elf_to_pb     = 1
-      };
-      capture_ctx = capture_ctx_;
+      void * capture_ctx_mem = fd_spad_alloc( runner->spad, fd_capture_ctx_align(), fd_capture_ctx_footprint() );
+      capture_ctx            = fd_capture_ctx_new( capture_ctx_mem );
+      if( FD_UNLIKELY( capture_ctx==NULL ) ) {
+        FD_LOG_ERR(("capture_ctx_mem is NULL, cannot write solcap"));
+      }
+      capture_ctx->capture   = runner->solcap;
+      capture_ctx->solcap_start_slot = fd_bank_slot_get( slot_ctx->bank );
+      slot_ctx->capture_ctx = capture_ctx;
+      fd_solcap_writer_set_slot( slot_ctx->capture_ctx->capture, fd_bank_slot_get( slot_ctx->bank ) );
     }
 
     fd_rewards_recalculate_partitioned_rewards( slot_ctx, capture_ctx, runner->spad );
@@ -454,14 +467,10 @@ fd_runtime_fuzz_block_ctx_exec( fd_solfuzz_runner_t *      runner,
     int is_epoch_boundary = 0;
     fd_runtime_block_pre_execute_process_new_epoch( slot_ctx, capture_ctx, runner->spad, &is_epoch_boundary );
 
-    int res = fd_runtime_block_execute_prepare( slot_ctx, runner->spad );
+    res = fd_runtime_block_execute_prepare( slot_ctx, runner->spad );
     if( FD_UNLIKELY( res ) ) {
       return res;
     }
-
-    /* Initialize the cost tracker */
-    fd_cost_tracker_t * cost_tracker = fd_spad_alloc( runner->spad, FD_COST_TRACKER_ALIGN, sizeof(fd_cost_tracker_t) );
-    fd_cost_tracker_init( cost_tracker, runner->spad );
 
     fd_txn_p_t * txn_ptrs = block_info->microblock_batch_infos[0].microblock_infos[0].txns;
     ulong        txn_cnt  = block_info->microblock_batch_infos[0].txn_cnt;
@@ -474,12 +483,12 @@ fd_runtime_fuzz_block_ctx_exec( fd_solfuzz_runner_t *      runner,
       fd_runtime_update_program_cache( slot_ctx, txn, runner->spad );
 
       /* Execute the transaction against the runtime */
-      int exec_res = FD_RUNTIME_EXECUTE_SUCCESS;
-      fd_exec_txn_ctx_t * txn_ctx = fd_runtime_fuzz_txn_ctx_exec( runner, slot_ctx, txn, &exec_res );
-      txn_ctx->exec_err           = exec_res;
+      res = FD_RUNTIME_EXECUTE_SUCCESS;
+      fd_exec_txn_ctx_t * txn_ctx = fd_runtime_fuzz_txn_ctx_exec( runner, slot_ctx, txn, &res );
+      txn_ctx->exec_err           = res;
 
-      if( FD_UNLIKELY( !( txn->flags & FD_TXN_P_FLAGS_EXECUTE_SUCCESS) ) ) {
-        continue;
+      if( FD_UNLIKELY( !(txn_ctx->flags & FD_TXN_P_FLAGS_EXECUTE_SUCCESS) ) ) {
+        break;
       }
 
       /* Finalize the transaction */
@@ -490,16 +499,15 @@ fd_runtime_fuzz_block_ctx_exec( fd_solfuzz_runner_t *      runner,
           slot_ctx->bank,
           capture_ctx );
 
-      /* Update the cost tracker */
-      fd_transaction_cost_t transaction_cost = fd_calculate_cost_for_executed_transaction( txn_ctx, runner->spad );
-      res = fd_cost_tracker_try_add( cost_tracker, txn_ctx, &transaction_cost );
-      if( FD_UNLIKELY( res ) ) {
-        return res;
+      if( FD_UNLIKELY( !(txn_ctx->flags & FD_TXN_P_FLAGS_EXECUTE_SUCCESS) ) ) {
+        break;
       }
+
+      res = FD_RUNTIME_EXECUTE_SUCCESS;
     }
 
     /* Finalize the block */
-    fd_runtime_block_execute_finalize( slot_ctx, block_info, runner->spad );
+    fd_runtime_block_execute_finalize( slot_ctx );
   } FD_SPAD_FRAME_END;
 
   return res;
@@ -550,6 +558,14 @@ fd_solfuzz_block_run( fd_solfuzz_runner_t * runner,
     /* Capture hashes */
     fd_hash_t bank_hash = fd_bank_bank_hash_get( slot_ctx->bank );
     fd_memcpy( effects->bank_hash, bank_hash.hash, sizeof(fd_hash_t) );
+
+    /* Capture cost tracker */
+    fd_cost_tracker_t cost_tracker = fd_bank_cost_tracker_get( slot_ctx->bank );
+    effects->has_cost_tracker = 1;
+    effects->cost_tracker = (fd_exec_test_cost_tracker_t) {
+      .block_cost = cost_tracker.block_cost,
+      .vote_cost  = cost_tracker.vote_cost,
+    };
 
     ulong actual_end = FD_SCRATCH_ALLOC_FINI( l, 1UL );
     fd_runtime_fuzz_block_ctx_destroy( runner );

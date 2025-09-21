@@ -126,7 +126,7 @@ typedef struct effective_activating effective_activating_t;
 
 static int
 get_state( fd_txn_account_t const * self,
-           fd_stake_state_v2_t *         out ) {
+           fd_stake_state_v2_t *    out ) {
   int rc;
 
   fd_bincode_decode_ctx_t bincode_ctx = {
@@ -3247,7 +3247,6 @@ write_stake_config( fd_exec_slot_ctx_t * slot_ctx, fd_stake_config_t const * sta
   FD_TEST( !err );
 
   fd_txn_account_set_lamports( rec, 960480UL );
-  fd_txn_account_set_rent_epoch( rec, 0UL );
   fd_txn_account_set_executable( rec, 0 );
 
   fd_bincode_encode_ctx_t ctx3;

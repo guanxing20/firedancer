@@ -2,6 +2,7 @@
 
 #define _GNU_SOURCE
 #include "fd_solfuzz.h"
+#include "../fd_bank.h"
 #include "../fd_runtime.h"
 #include <errno.h>
 #include <sys/mman.h>
@@ -71,8 +72,9 @@ fd_wksp_demand_paged_delete( fd_wksp_t * wksp ) {
 }
 
 fd_solfuzz_runner_t *
-fd_solfuzz_runner_new( fd_wksp_t * wksp,
-                       ulong       wksp_tag ) {
+fd_solfuzz_runner_new( fd_wksp_t *                         wksp,
+                       ulong                               wksp_tag,
+                       fd_solfuzz_runner_options_t const * options ) {
 
   /* Allocate objects */
   ulong const txn_max  =   64UL;
@@ -99,11 +101,13 @@ fd_solfuzz_runner_new( fd_wksp_t * wksp,
   if( FD_UNLIKELY( !runner->spad ) ) goto bail2;
   runner->banks = fd_banks_join( fd_banks_new( banks_mem, bank_max, fork_max ) );
   if( FD_UNLIKELY( !runner->banks ) ) goto bail2;
-  runner->bank = fd_banks_init_bank( runner->banks, 0UL );
+  runner->bank = fd_banks_init_bank( runner->banks, fd_eslot( 0UL, 0UL ) );
   if( FD_UNLIKELY( !runner->bank ) ) {
     FD_LOG_WARNING(( "fd_banks_init_bank failed" ));
     goto bail2;
   }
+
+  runner->enable_vm_tracing = options->enable_vm_tracing;
   return runner;
 
 bail2:

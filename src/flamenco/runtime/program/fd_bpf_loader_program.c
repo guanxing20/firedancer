@@ -403,7 +403,9 @@ fd_bpf_execute( fd_exec_instr_ctx_t *            instr_ctx,
   fd_sbpf_syscalls_t * syscalls = fd_sbpf_syscalls_new( fd_spad_alloc( instr_ctx->txn_ctx->spad,
                                                                        fd_sbpf_syscalls_align(),
                                                                        fd_sbpf_syscalls_footprint() ) );
-  FD_TEST( syscalls );
+  if( FD_UNLIKELY( !syscalls ) ) {
+    FD_LOG_CRIT(( "Unable to allocate syscalls" ));
+  }
 
   /* TODO do we really need to re-do this on every instruction? */
   fd_vm_syscall_register_slot( syscalls,
@@ -418,12 +420,11 @@ fd_bpf_execute( fd_exec_instr_ctx_t *            instr_ctx,
   fd_vm_acc_region_meta_t acc_region_metas[256]                   = {0}; /* instr acc idx to idx */
   uint                    input_mem_regions_cnt                   = 0U;
   int                     direct_mapping                          = FD_FEATURE_ACTIVE_BANK( instr_ctx->txn_ctx->bank, bpf_account_data_direct_mapping );
-  int                     mask_out_rent_epoch_in_vm_serialization = FD_FEATURE_ACTIVE_BANK( instr_ctx->txn_ctx->bank, mask_out_rent_epoch_in_vm_serialization );
 
   uchar * input = NULL;
   err = fd_bpf_loader_input_serialize_parameters( instr_ctx, &input_sz, pre_lens,
                                                   input_mem_regions, &input_mem_regions_cnt,
-                                                  acc_region_metas, direct_mapping, mask_out_rent_epoch_in_vm_serialization,
+                                                  acc_region_metas, direct_mapping,
                                                   is_deprecated, &input );
   if( FD_UNLIKELY( err ) ) {
     return err;
@@ -460,14 +461,14 @@ fd_bpf_execute( fd_exec_instr_ctx_t *            instr_ctx,
     /* instr_ctx             */ instr_ctx,
     /* heap_max              */ heap_size,
     /* entry_cu              */ instr_ctx->txn_ctx->compute_budget_details.compute_meter,
-    /* rodata                */ cache_entry->rodata,
+    /* rodata                */ fd_program_cache_get_rodata( cache_entry ),
     /* rodata_sz             */ cache_entry->rodata_sz,
-    /* text                  */ (ulong *)((ulong)cache_entry->rodata + (ulong)cache_entry->text_off), /* Note: text_off is byte offset */
+    /* text                  */ (ulong *)((ulong)fd_program_cache_get_rodata( cache_entry ) + (ulong)cache_entry->text_off), /* Note: text_off is byte offset */
     /* text_cnt              */ cache_entry->text_cnt,
     /* text_off              */ cache_entry->text_off,
     /* text_sz               */ cache_entry->text_sz,
     /* entry_pc              */ cache_entry->entry_pc,
-    /* calldests             */ cache_entry->calldests,
+    /* calldests             */ fd_program_cache_get_calldests( cache_entry ),
     /* sbpf_version          */ cache_entry->sbpf_version,
     /* syscalls              */ syscalls,
     /* trace                 */ NULL,
@@ -487,19 +488,13 @@ fd_bpf_execute( fd_exec_instr_ctx_t *            instr_ctx,
     return FD_EXECUTOR_INSTR_ERR_PROGRAM_ENVIRONMENT_SETUP_FAILURE;
   }
 
-#ifdef FD_DEBUG_SBPF_TRACES
-  uchar * signature = (uchar*)vm->instr_ctx->txn_ctx->_txn_raw->raw + vm->instr_ctx->txn_ctx->txn_descriptor->signature_off;
-  uchar sig[64];
-  /* TODO (topointon): make this run-time configurable, no need for this ifdef */
-  fd_base58_decode_64( "tkacc4VCh2z9cLsQowCnKqX14DmUUxpRyES755FhUzrFxSFvo8kVk444kNTL7kJxYnnANYwRWAdHCgBJupftZrz", sig );
-  if( FD_UNLIKELY( !memcmp( signature, sig, 64UL ) ) ) {
-    ulong event_max = FD_RUNTIME_VM_TRACE_EVENT_MAX;
+  if( FD_UNLIKELY( instr_ctx->txn_ctx->fuzz_config.enable_vm_tracing ) ) {
+    ulong event_max      = FD_RUNTIME_VM_TRACE_EVENT_MAX;
     ulong event_data_max = FD_RUNTIME_VM_TRACE_EVENT_DATA_MAX;
     vm->trace = fd_vm_trace_join( fd_vm_trace_new( fd_spad_alloc(
     instr_ctx->txn_ctx->spad, fd_vm_trace_align(), fd_vm_trace_footprint( event_max, event_data_max ) ), event_max, event_data_max ) );
     if( FD_UNLIKELY( !vm->trace ) ) FD_LOG_ERR(( "unable to create trace; make sure you've compiled with sufficient spad size " ));
   }
-#endif
 
   int exec_err = fd_vm_exec( vm );
   instr_ctx->txn_ctx->compute_budget_details.compute_meter = vm->cu;
@@ -1174,8 +1169,8 @@ process_loader_upgradeable_instruction( fd_exec_instr_ctx_t * instr_ctx ) {
       /* Create ProgramData account */
 
       fd_pubkey_t derived_address[ 1UL ];
-      uchar * seeds[ 1UL ];
-      seeds[ 0UL ]    = (uchar *)new_program_id;
+      uchar const * seeds[ 1UL ];
+      seeds[ 0UL ]    = (uchar const *)new_program_id;
       ulong seed_sz   = sizeof(fd_pubkey_t);
       uchar bump_seed = 0;
       err = fd_pubkey_find_program_address( program_id, 1UL, seeds, &seed_sz, derived_address,
@@ -2471,9 +2466,9 @@ fd_bpf_loader_program_execute( fd_exec_instr_ctx_t * ctx ) {
       Every error that comes out of this block is mapped to an InvalidAccountData instruction error in Agave. */
 
     fd_account_meta_t const * metadata = fd_borrowed_account_get_acc_meta( &program_account );
-    uchar is_deprecated = !memcmp( metadata->info.owner, &fd_solana_bpf_loader_deprecated_program_id, sizeof(fd_pubkey_t) );
+    uchar is_deprecated = !memcmp( metadata->owner, &fd_solana_bpf_loader_deprecated_program_id, sizeof(fd_pubkey_t) );
 
-    if( !memcmp( metadata->info.owner, &fd_solana_bpf_loader_upgradeable_program_id, sizeof(fd_pubkey_t) ) ) {
+    if( !memcmp( metadata->owner, &fd_solana_bpf_loader_upgradeable_program_id, sizeof(fd_pubkey_t) ) ) {
       fd_bpf_upgradeable_loader_state_t * program_account_state = fd_bpf_loader_program_get_state( program_account.acct, ctx->txn_ctx->spad, &err );
       if( FD_UNLIKELY( err!=FD_BINCODE_SUCCESS ) ) {
         fd_log_collector_msg_literal( ctx, "Program is not deployed" );

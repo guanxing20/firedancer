@@ -69,9 +69,7 @@ struct fd_crds_entry_private {
       /* TODO: stake-ordered treap/pq? */
     } contact_info;
     struct {
-      /* TODO: only needed for upsert/override checks. Can we use offsets into
-         data/payload instead? */
-      uchar  token[ 32UL ];
+      ulong  token;
     } node_instance;
   };
 
@@ -759,9 +757,9 @@ crds_entry_init( fd_gossip_view_crds_value_t const * view,
   out_value->hash.hash = fd_ulong_load_8( out_value->value_hash );
 
   if( FD_UNLIKELY( view->tag==FD_GOSSIP_VALUE_NODE_INSTANCE ) ) {
-    fd_memcpy( out_value->node_instance.token, payload + view->node_instance->token_off, 32UL );
+    out_value->node_instance.token = view->node_instance->token;
   } else if( FD_UNLIKELY( key->tag==FD_GOSSIP_VALUE_CONTACT_INFO ) ) {
-    out_value->contact_info.instance_creation_wallclock_nanos = view->contact_info->instance_creation_wallclock_nanos;
+    out_value->contact_info.instance_creation_wallclock_nanos = view->ci_view->contact_info->instance_creation_wallclock_nanos;
     /* Contact Info entry will be added to sampler upon successful insertion */
     out_value->contact_info.sampler_idx = SAMPLE_IDX_SENTINEL;
   }
@@ -811,7 +809,7 @@ overrides_fast( fd_crds_entry_t const *             incumbent,
   long existing_wc        = incumbent->wallclock_nanos;
   long candidate_wc       = candidate->wallclock_nanos;
   long existing_ci_onset  = incumbent->contact_info.instance_creation_wallclock_nanos;
-  long candidate_ci_onset = candidate->contact_info->instance_creation_wallclock_nanos;
+  long candidate_ci_onset = candidate->ci_view->contact_info->instance_creation_wallclock_nanos;
 
   switch( candidate->tag ) {
     case FD_GOSSIP_VALUE_CONTACT_INFO:
@@ -821,11 +819,11 @@ overrides_fast( fd_crds_entry_t const *             incumbent,
       else if( FD_UNLIKELY( candidate_wc<existing_wc ) ) return 0;
       break;
     case FD_GOSSIP_VALUE_NODE_INSTANCE:
-      if( FD_LIKELY( !memcmp( payload+candidate->node_instance->token_off, incumbent->node_instance.token, 32UL ) ) ) break;
+      if( FD_LIKELY( candidate->node_instance->token==incumbent->node_instance.token ) ) break;
       else if( FD_LIKELY( memcmp( payload+candidate->pubkey_off, incumbent->key.pubkey, 32UL ) ) ) break;
       else if( FD_UNLIKELY( candidate_wc>existing_wc ) ) return 1;
       else if( FD_UNLIKELY( candidate_wc<existing_wc ) ) return 0;
-      else if( memcmp( payload+candidate->node_instance->token_off, incumbent->node_instance.token, 32UL ) < 0 ) return 0;;
+      else if( candidate->node_instance->token<incumbent->node_instance.token ) return 0;;
       break;
     default:
       break;
@@ -1071,7 +1069,7 @@ fd_crds_insert( fd_crds_t *                         crds,
   lookup_map_ele_insert( crds->lookup_map, candidate, crds->pool );
 
   if( FD_UNLIKELY( candidate->key.tag==FD_GOSSIP_VALUE_CONTACT_INFO ) ) {
-    fd_crds_contact_info_init( candidate_view, payload, candidate->contact_info.ci->contact_info );
+    fd_memcpy( candidate->contact_info.ci->contact_info, candidate_view->ci_view->contact_info, sizeof(fd_contact_info_t) );
     /* Default to active, since we filter inactive entries prior to insertion */
     candidate->contact_info.is_active = 1;
 
@@ -1165,9 +1163,9 @@ set_peer_active_status( fd_crds_t *   crds,
   if( FD_UNLIKELY( old_status!=status ) ) {
     /* Trigger sampler update */
     crds_samplers_upd_peer_at_idx( crds->samplers,
-                            peer_ci,
-                            peer_ci->contact_info.sampler_idx,
-                            now );
+                                   peer_ci,
+                                   peer_ci->contact_info.sampler_idx,
+                                   now );
   }
 }
 void
