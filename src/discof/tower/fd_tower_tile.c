@@ -1,6 +1,7 @@
 #include "fd_tower_tile.h"
 #include "generated/fd_tower_tile_seccomp.h"
 
+#include "../genesis/fd_genesi_tile.h"
 #include "../replay/fd_replay_tile.h"
 #include "../../choreo/ghost/fd_ghost.h"
 #include "../../choreo/tower/fd_tower.h"
@@ -196,6 +197,7 @@ replay_slot_completed( fd_tower_tile_t *            ctx,
   /* 1. Determine next slot to vote for, if one exists. */
 
   msg->vote_slot = fd_tower_vote_slot( ctx->tower, ctx->epoch, ctx->vote_keys, ctx->vote_towers, ctx->replay_towers_cnt, ctx->ghost );
+  msg->new_root  = 0UL;
 
   /* 2. Determine new root, if there is one.  A new vote slot can result
         in a new root but not always. */
@@ -207,9 +209,6 @@ replay_slot_completed( fd_tower_tile_t *            ctx,
       msg->root_block_id = *root_block_id;
       msg->new_root      = 1;
       fd_ghost_publish( ctx->ghost, &msg->root_block_id );
-    } else {
-      msg->root_block_id = (fd_hash_t){ 0 };
-      msg->new_root      = 0;
     }
   }
 
@@ -333,8 +332,10 @@ returnable_frag( fd_tower_tile_t *   ctx,
   (void)tspub;
 
   if( FD_LIKELY( ctx->in_kind[ in_idx ]==IN_KIND_GENESIS ) ) {
-    init_genesis( ctx, fd_type_pun( (uchar*)fd_chunk_to_laddr( ctx->in[ in_idx ].mem, chunk )+sizeof(fd_lthash_value_t)+sizeof(fd_hash_t) ) );
-    ctx->initialized = 1;
+    if( FD_LIKELY( sig==GENESI_SIG_BOOTSTRAP_COMPLETED ) ) {
+      init_genesis( ctx, fd_type_pun( (uchar*)fd_chunk_to_laddr( ctx->in[ in_idx ].mem, chunk )+sizeof(fd_lthash_value_t)+sizeof(fd_hash_t) ) );
+      ctx->initialized = 1;
+    }
   } else if( FD_LIKELY( ctx->in_kind[ in_idx ]==IN_KIND_SNAP ) ) {
     if( FD_UNLIKELY( fd_ssmsg_sig_message( sig )==FD_SSMSG_DONE ) ) {
       snapshot_done( ctx, &ctx->manifest );
@@ -364,10 +365,6 @@ returnable_frag( fd_tower_tile_t *   ctx,
       ctx->replay_towers_cnt++;
 
       if( FD_UNLIKELY( fd_frag_meta_ctl_eom( ctl ) ) ) replay_slot_completed( ctx, &ctx->replay_slot_info, tsorig, stem );
-    } else if( FD_UNLIKELY( sig==REPLAY_SIG_ROOT_ADVANCED ) ) {
-      /* Ignore root advanced messages, we don't need them */
-    } else {
-      FD_LOG_ERR(( "unexpected replay message sig %lu", sig ));
     }
   } else {
     FD_LOG_ERR(( "unexpected input kind %d", ctx->in_kind[ in_idx ] ));
@@ -443,9 +440,9 @@ unprivileged_init( fd_topo_t *      topo,
     fd_topo_link_t * link = &topo->links[ tile->in_link_id[ i ] ];
     fd_topo_wksp_t * link_wksp = &topo->workspaces[ topo->objs[ link->dcache_obj_id ].wksp_id ];
 
-    if( FD_LIKELY( !strcmp( link->name, "genesi_out"      ) ) ) ctx->in_kind[ i ] = IN_KIND_GENESIS;
-    else if( FD_LIKELY( !strcmp( link->name, "snap_out"   ) ) ) ctx->in_kind[ i ] = IN_KIND_SNAP;
-    else if( FD_LIKELY( !strcmp( link->name, "replay_out" ) ) ) ctx->in_kind[ i ] = IN_KIND_REPLAY;
+    if( FD_LIKELY( !strcmp( link->name, "genesi_out"        ) ) ) ctx->in_kind[ i ] = IN_KIND_GENESIS;
+    else if( FD_LIKELY( !strcmp( link->name, "snapin_manif" ) ) ) ctx->in_kind[ i ] = IN_KIND_SNAP;
+    else if( FD_LIKELY( !strcmp( link->name, "replay_out"   ) ) ) ctx->in_kind[ i ] = IN_KIND_REPLAY;
     else FD_LOG_ERR(( "tower tile has unexpected input link %lu %s", i, link->name ));
 
     ctx->in[ i ].mem    = link_wksp->wksp;
@@ -488,8 +485,8 @@ populate_allowed_fds( fd_topo_t const *      topo,
   out_fds[ out_cnt++ ] = 2; /* stderr */
   if( FD_LIKELY( -1!=fd_log_private_logfile_fd() ) )
     out_fds[ out_cnt++ ] = fd_log_private_logfile_fd(); /* logfile */
-  out_fds[ out_cnt++ ] = ctx->checkpt_fd;
-  out_fds[ out_cnt++ ] = ctx->restore_fd;
+  if( FD_LIKELY( ctx->checkpt_fd!=-1 ) ) out_fds[ out_cnt++ ] = ctx->checkpt_fd;
+  if( FD_LIKELY( ctx->restore_fd!=-1 ) ) out_fds[ out_cnt++ ] = ctx->restore_fd;
   return out_cnt;
 }
 

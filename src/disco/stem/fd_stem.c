@@ -278,7 +278,7 @@ STEM_(run1)( ulong                        in_cnt,
   ulong metric_in_backp;  /* is the run loop currently backpressured by one or more of the outs, in [0,1] */
   ulong metric_backp_cnt; /* Accumulates number of transitions of tile to backpressured between housekeeping events */
 
-  ulong metric_regime_ticks[9];    /* How many ticks the tile has spent in each regime */
+  ulong metric_regime_ticks[ FD_METRICS_ENUM_TILE_REGIME_CNT ]; /* How many ticks the tile has spent in each regime */
 
   if( FD_UNLIKELY( !scratch ) ) FD_LOG_ERR(( "NULL scratch" ));
   if( FD_UNLIKELY( !fd_ulong_is_aligned( (ulong)scratch, STEM_(scratch_align)() ) ) ) FD_LOG_ERR(( "misaligned scratch" ));
@@ -359,6 +359,7 @@ STEM_(run1)( ulong                        in_cnt,
   /* housekeeping init */
 
   if( lazy<=0L ) lazy = fd_tempo_lazy_default( cr_max );
+  if( FD_UNLIKELY( lazy>(long)1e9 ) ) FD_LOG_ERR(( "excessive stem lazy value: %li", lazy ));
   FD_LOG_INFO(( "Configuring housekeeping (lazy %li ns)", lazy ));
 
   /* Initialize the initial event sequence to immediately update

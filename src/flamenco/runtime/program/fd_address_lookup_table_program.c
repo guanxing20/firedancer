@@ -6,8 +6,19 @@
 #include "../../vm/syscall/fd_vm_syscall.h"
 #include "fd_native_cpi.h"
 #include "../fd_runtime_err.h"
+#include "../fd_system_ids.h"
 
 #include <string.h>
+
+/* The worst case address lookup table footprint is for the extend
+   instruction which is dynamically sized based on the number of new
+   entries.  Assuming that the instruction takes up the full transaction
+   MTU (1232 bytes), we can have 1232/32 entries = 38 entries.  This is
+   not the tightest bound possible, but it is reasonable.
+   The total footprint is then sizeof(fd_addrlut_instruction_t) + 38
+   entries * sizeof(fd_pubkey_t) = 1240 bytes. */
+
+#define FD_ADDRLUT_INSTR_FOOTPRINT (1240UL)
 
 struct fd_addrlut {
   fd_address_lookup_table_state_t state;
@@ -195,7 +206,7 @@ create_lookup_table( fd_exec_instr_ctx_t *       ctx,
   /* Prepare LUT account **********************************************/
   /* https://github.com/anza-xyz/agave/blob/v2.1.4/programs/address-lookup-table/src/processor.rs#L59-L60 */
   /* try_borrow_instruction_account => get_index_of_instruction_account_in_transaction */
-  fd_guarded_borrowed_account_t lut_acct;
+  fd_guarded_borrowed_account_t lut_acct = {0};
   FD_TRY_BORROW_INSTR_ACCOUNT_DEFAULT_ERR_CHECK( ctx, ACC_IDX_LUT, &lut_acct );
 
   /* https://github.com/solana-labs/solana/blob/v1.17.4/programs/address-lookup-table/src/processor.rs#L60-L62 */
@@ -216,7 +227,7 @@ create_lookup_table( fd_exec_instr_ctx_t *       ctx,
   /* Prepare authority account ****************************************/
   /* https://github.com/anza-xyz/agave/blob/v2.1.4/programs/address-lookup-table/src/processor.rs#L74-L75 */
   /* try_borrow_instruction_account => get_index_of_instruction_account_in_transaction */
-  fd_guarded_borrowed_account_t authority_acct;
+  fd_guarded_borrowed_account_t authority_acct = {0};
   FD_TRY_BORROW_INSTR_ACCOUNT_DEFAULT_ERR_CHECK( ctx, ACC_IDX_AUTHORITY, &authority_acct );
 
 
@@ -225,7 +236,7 @@ create_lookup_table( fd_exec_instr_ctx_t *       ctx,
 
   /* https://github.com/solana-labs/solana/blob/v1.17.4/programs/address-lookup-table/src/processor.rs#L76-L83 */
   if( !FD_FEATURE_ACTIVE_BANK( ctx->txn_ctx->bank, relax_authority_signer_check_for_lookup_table_creation )
-      && !fd_instr_acc_is_signer_idx( ctx->instr, ACC_IDX_AUTHORITY ) ) {
+      && !fd_instr_acc_is_signer_idx( ctx->instr, ACC_IDX_AUTHORITY, NULL ) ) {
     fd_log_collector_msg_literal( ctx, "Authority account must be a signer" );
     return FD_EXECUTOR_INSTR_ERR_MISSING_REQUIRED_SIGNATURE;
   }
@@ -236,13 +247,13 @@ create_lookup_table( fd_exec_instr_ctx_t *       ctx,
   /* Prepare payer account ********************************************/
   /* https://github.com/anza-xyz/agave/blob/v2.1.4/programs/address-lookup-table/src/processor.rs#L87-L88 */
     /* try_borrow_account => get_index_of_instruction_account_in_transaction */
-  fd_guarded_borrowed_account_t payer_acct;
+  fd_guarded_borrowed_account_t payer_acct = {0};
   FD_TRY_BORROW_INSTR_ACCOUNT_DEFAULT_ERR_CHECK( ctx, ACC_IDX_PAYER, &payer_acct );
 
   payer_key = payer_acct.acct->pubkey;
 
   /* https://github.com/solana-labs/solana/blob/v1.17.4/programs/address-lookup-table/src/processor.rs#L89-L92 */
-  if( !fd_instr_acc_is_signer_idx( ctx->instr, ACC_IDX_PAYER ) ) {
+  if( !fd_instr_acc_is_signer_idx( ctx->instr, ACC_IDX_PAYER, NULL ) ) {
     fd_log_collector_msg_literal( ctx, "Payer account must be a signer" );
     return FD_EXECUTOR_INSTR_ERR_MISSING_REQUIRED_SIGNATURE;
   }
@@ -308,67 +319,21 @@ create_lookup_table( fd_exec_instr_ctx_t *       ctx,
   /* https://github.com/solana-labs/solana/blob/v1.17.4/programs/address-lookup-table/src/processor.rs#L144-L149 */
   if( required_lamports>0UL ) {
     // Create account metas
-    FD_SPAD_FRAME_BEGIN( ctx->txn_ctx->spad ) {
-      fd_vm_rust_account_meta_t * acct_metas = (fd_vm_rust_account_meta_t *)
-                                                fd_spad_alloc( ctx->txn_ctx->spad, FD_VM_RUST_ACCOUNT_META_ALIGN, 2 * sizeof(fd_vm_rust_account_meta_t) );
-      fd_native_cpi_create_account_meta( payer_key, 1, 1, &acct_metas[0] );
-      fd_native_cpi_create_account_meta( lut_key,   0, 1, &acct_metas[1] );
-
-      // Create signers list
-      fd_pubkey_t signers[16];
-      ulong signers_cnt = 1;
-      signers[0] = *payer_key;
-
-      // Create system program instruction
-      uchar instr_data[FD_TXN_MTU];
-      fd_system_program_instruction_t instr = {
-        .discriminant = fd_system_program_instruction_enum_transfer,
-        .inner = {
-          .transfer = required_lamports,
-        }
-      };
-
-      fd_bincode_encode_ctx_t encode_ctx = {
-        .data    = instr_data,
-        .dataend = instr_data + FD_TXN_MTU
-      };
-
-      // This should never fail.
-      int err = fd_system_program_instruction_encode( &instr, &encode_ctx );
-      if( FD_UNLIKELY( err ) ) {
-        return FD_EXECUTOR_INSTR_ERR_FATAL;
-      }
-
-      err = fd_native_cpi_native_invoke( ctx,
-                                         &fd_solana_system_program_id,
-                                         instr_data,
-                                         FD_TXN_MTU,
-                                         acct_metas,
-                                         2UL,
-                                         signers,
-                                         signers_cnt );
-      if( FD_UNLIKELY( err ) ) {
-        return err;
-      }
-    } FD_SPAD_FRAME_END;
-  }
-
-  FD_SPAD_FRAME_BEGIN( ctx->txn_ctx->spad ) {
-    fd_vm_rust_account_meta_t * acct_metas = ( fd_vm_rust_account_meta_t * )
-                                              fd_spad_alloc( ctx->txn_ctx->spad, FD_VM_RUST_ACCOUNT_META_ALIGN, sizeof(fd_vm_rust_account_meta_t) );
-    fd_native_cpi_create_account_meta( lut_key, 1, 1, &acct_metas[0] );
+    fd_vm_rust_account_meta_t acct_metas[ 2UL ];
+    fd_native_cpi_create_account_meta( payer_key, 1, 1, &acct_metas[0] );
+    fd_native_cpi_create_account_meta( lut_key,   0, 1, &acct_metas[1] );
 
     // Create signers list
     fd_pubkey_t signers[16];
     ulong signers_cnt = 1;
-    signers[0] = *lut_key;
+    signers[0] = *payer_key;
 
-    // Create system program allocate instruction
+    // Create system program instruction
     uchar instr_data[FD_TXN_MTU];
     fd_system_program_instruction_t instr = {
-      .discriminant = fd_system_program_instruction_enum_allocate,
+      .discriminant = fd_system_program_instruction_enum_transfer,
       .inner = {
-        .allocate = FD_LOOKUP_TABLE_META_SIZE,
+        .transfer = required_lamports,
       }
     };
 
@@ -383,51 +348,91 @@ create_lookup_table( fd_exec_instr_ctx_t *       ctx,
       return FD_EXECUTOR_INSTR_ERR_FATAL;
     }
 
-    // Execute allocate instruction
     err = fd_native_cpi_native_invoke( ctx,
                                        &fd_solana_system_program_id,
                                        instr_data,
                                        FD_TXN_MTU,
                                        acct_metas,
-                                       1UL,
+                                       2UL,
                                        signers,
                                        signers_cnt );
     if( FD_UNLIKELY( err ) ) {
       return err;
     }
+  }
 
-    // Prepare system program assign instruction
-    instr = (fd_system_program_instruction_t) {
-      .discriminant = fd_system_program_instruction_enum_assign,
-      .inner = {
-        .assign = fd_solana_address_lookup_table_program_id,
-      }
-    };
+  fd_vm_rust_account_meta_t acct_metas[ 1UL ];
+  fd_native_cpi_create_account_meta( lut_key, 1, 1, acct_metas );
 
-    encode_ctx = (fd_bincode_encode_ctx_t) {
-      .data    = instr_data,
-      .dataend = instr_data + FD_TXN_MTU
-    };
+  // Create signers list
+  fd_pubkey_t signers[16];
+  ulong signers_cnt = 1;
+  signers[0] = *lut_key;
 
-    // This should never fail.
-    err = fd_system_program_instruction_encode( &instr, &encode_ctx );
-    if( FD_UNLIKELY( err ) ) {
-      return FD_EXECUTOR_INSTR_ERR_FATAL;
+  // Create system program allocate instruction
+  uchar instr_data[FD_TXN_MTU];
+  fd_system_program_instruction_t instr = {
+    .discriminant = fd_system_program_instruction_enum_allocate,
+    .inner = {
+      .allocate = FD_LOOKUP_TABLE_META_SIZE,
     }
+  };
 
-    // Execute assign instruction
-    err = fd_native_cpi_native_invoke( ctx,
-                                       &fd_solana_system_program_id,
-                                       instr_data,
-                                       FD_TXN_MTU,
-                                       acct_metas,
-                                       1UL,
-                                       signers,
-                                       signers_cnt );
-    if( FD_UNLIKELY( err ) ) {
-      return err;
+  fd_bincode_encode_ctx_t encode_ctx = {
+    .data    = instr_data,
+    .dataend = instr_data + FD_TXN_MTU
+  };
+
+  // This should never fail.
+  err = fd_system_program_instruction_encode( &instr, &encode_ctx );
+  if( FD_UNLIKELY( err ) ) {
+    return FD_EXECUTOR_INSTR_ERR_FATAL;
+  }
+
+  // Execute allocate instruction
+  err = fd_native_cpi_native_invoke( ctx,
+                                     &fd_solana_system_program_id,
+                                     instr_data,
+                                     FD_TXN_MTU,
+                                     acct_metas,
+                                     1UL,
+                                     signers,
+                                     signers_cnt );
+  if( FD_UNLIKELY( err ) ) {
+    return err;
+  }
+
+  // Prepare system program assign instruction
+  instr = (fd_system_program_instruction_t) {
+    .discriminant = fd_system_program_instruction_enum_assign,
+    .inner = {
+      .assign = fd_solana_address_lookup_table_program_id,
     }
-  } FD_SPAD_FRAME_END;
+  };
+
+  encode_ctx = (fd_bincode_encode_ctx_t) {
+    .data    = instr_data,
+    .dataend = instr_data + FD_TXN_MTU
+  };
+
+  // This should never fail.
+  err = fd_system_program_instruction_encode( &instr, &encode_ctx );
+  if( FD_UNLIKELY( err ) ) {
+    return FD_EXECUTOR_INSTR_ERR_FATAL;
+  }
+
+  // Execute assign instruction
+  err = fd_native_cpi_native_invoke( ctx,
+                                     &fd_solana_system_program_id,
+                                     instr_data,
+                                     FD_TXN_MTU,
+                                     acct_metas,
+                                     1UL,
+                                     signers,
+                                     signers_cnt );
+  if( FD_UNLIKELY( err ) ) {
+    return err;
+  }
 
 
   /* https://github.com/anza-xyz/agave/blob/v2.1.4/programs/address-lookup-table/src/processor.rs#L164-L165 */
@@ -470,7 +475,7 @@ freeze_lookup_table( fd_exec_instr_ctx_t * ctx ) {
   /* Prepare LUT account **********************************************/
   /* https://github.com/anza-xyz/agave/blob/v2.1.4/programs/address-lookup-table/src/processor.rs#L177-L178 */
   /* try_borrow_account => get_index_of_instruction_account_in_transaction */
-  fd_guarded_borrowed_account_t lut_acct;
+  fd_guarded_borrowed_account_t lut_acct = {0};
   FD_TRY_BORROW_INSTR_ACCOUNT_DEFAULT_ERR_CHECK( ctx, ACC_IDX_LUT, &lut_acct );
 
   /* https://github.com/solana-labs/solana/blob/v1.17.4/programs/address-lookup-table/src/processor.rs#L178-L181 */
@@ -485,13 +490,13 @@ freeze_lookup_table( fd_exec_instr_ctx_t * ctx ) {
   /* https://github.com/anza-xyz/agave/blob/v2.1.4/programs/address-lookup-table/src/processor.rs#L184-L185 */
   fd_pubkey_t const * authority_key = NULL;
   /* try_borrow_account => get_index_of_instruction_account_in_transaction */
-  fd_guarded_borrowed_account_t authority_acct;
+  fd_guarded_borrowed_account_t authority_acct = {0};
   FD_TRY_BORROW_INSTR_ACCOUNT_DEFAULT_ERR_CHECK( ctx, ACC_IDX_AUTHORITY, &authority_acct );
 
   authority_key = authority_acct.acct->pubkey;
 
   /* https://github.com/solana-labs/solana/blob/v1.17.4/programs/address-lookup-table/src/processor.rs#L186-L189 */
-  if( FD_UNLIKELY( !fd_instr_acc_is_signer_idx( ctx->instr, ACC_IDX_AUTHORITY ) ) ) {
+  if( FD_UNLIKELY( !fd_instr_acc_is_signer_idx( ctx->instr, ACC_IDX_AUTHORITY, NULL ) ) ) {
     fd_log_collector_msg_literal( ctx, "Authority account must be a signer" );
     return FD_EXECUTOR_INSTR_ERR_MISSING_REQUIRED_SIGNATURE;
   }
@@ -576,7 +581,7 @@ extend_lookup_table( fd_exec_instr_ctx_t *       ctx,
   /* try_borrow_account => get_index_of_instruction_account_in_transaction */
 
   /* https://github.com/anza-xyz/agave/blob/v2.1.4/programs/address-lookup-table/src/processor.rs#L231-L232 */
-  fd_guarded_borrowed_account_t lut_acct;
+  fd_guarded_borrowed_account_t lut_acct = {0};
   FD_TRY_BORROW_INSTR_ACCOUNT_DEFAULT_ERR_CHECK( ctx, ACC_IDX_LUT, &lut_acct );
 
   lut_key = lut_acct.acct->pubkey;
@@ -593,13 +598,13 @@ extend_lookup_table( fd_exec_instr_ctx_t *       ctx,
   fd_pubkey_t const * authority_key = NULL;
   /* try_borrow_account => get_index_of_instruction_account_in_transaction */
   /* https://github.com/anza-xyz/agave/blob/v2.1.4/programs/address-lookup-table/src/processor.rs#L239-L240 */
-  fd_guarded_borrowed_account_t authority_acct;
+  fd_guarded_borrowed_account_t authority_acct = {0};
   FD_TRY_BORROW_INSTR_ACCOUNT_DEFAULT_ERR_CHECK( ctx, ACC_IDX_AUTHORITY, &authority_acct );
 
   authority_key = authority_acct.acct->pubkey;
 
   /* https://github.com/solana-labs/solana/blob/v1.17.4/programs/address-lookup-table/src/processor.rs#L241-L244 */
-  if( FD_UNLIKELY( !fd_instr_acc_is_signer_idx( ctx->instr, ACC_IDX_AUTHORITY ) ) ) {
+  if( FD_UNLIKELY( !fd_instr_acc_is_signer_idx( ctx->instr, ACC_IDX_AUTHORITY, NULL ) ) ) {
     fd_log_collector_msg_literal( ctx, "Authority account must be a signer" );
     return FD_EXECUTOR_INSTR_ERR_MISSING_REQUIRED_SIGNATURE;
   }
@@ -723,12 +728,12 @@ extend_lookup_table( fd_exec_instr_ctx_t *       ctx,
 
     /* try_borrow_account => get_index_of_instruction_account_in_transaction */
     /* https://github.com/anza-xyz/agave/blob/v2.1.4/programs/address-lookup-table/src/processor.rs#L325-L326 */
-    fd_guarded_borrowed_account_t payer_acct;
+    fd_guarded_borrowed_account_t payer_acct = {0};
     FD_TRY_BORROW_INSTR_ACCOUNT_DEFAULT_ERR_CHECK( ctx, ACC_IDX_PAYER, &payer_acct );
 
     payer_key = payer_acct.acct->pubkey;
     /* https://github.com/solana-labs/solana/blob/v1.17.4/programs/address-lookup-table/src/processor.rs#L327-L330 */
-    if( FD_UNLIKELY( !fd_instr_acc_is_signer_idx( ctx->instr, ACC_IDX_PAYER ) ) ) {
+    if( FD_UNLIKELY( !fd_instr_acc_is_signer_idx( ctx->instr, ACC_IDX_PAYER, NULL ) ) ) {
       fd_log_collector_msg_literal( ctx, "Payer account must be a signer" );
       return FD_EXECUTOR_INSTR_ERR_MISSING_REQUIRED_SIGNATURE;
     }
@@ -736,51 +741,47 @@ extend_lookup_table( fd_exec_instr_ctx_t *       ctx,
     /* https://github.com/anza-xyz/agave/blob/v2.1.4/programs/address-lookup-table/src/processor.rs#L332 */
     fd_borrowed_account_drop( &payer_acct );
 
+    // Create account metas
+    fd_vm_rust_account_meta_t acct_metas[ 2UL ];
+    fd_native_cpi_create_account_meta( payer_key, 1, 1, &acct_metas[0] );
+    fd_native_cpi_create_account_meta( lut_key,   0, 1, &acct_metas[1] );
 
-    FD_SPAD_FRAME_BEGIN( ctx->txn_ctx->spad ) {
-      // Create account metas
-      fd_vm_rust_account_meta_t * acct_metas = (fd_vm_rust_account_meta_t *)
-                                                fd_spad_alloc( ctx->txn_ctx->spad, FD_VM_RUST_ACCOUNT_META_ALIGN, 2 * sizeof(fd_vm_rust_account_meta_t) );
-      fd_native_cpi_create_account_meta( payer_key, 1, 1, &acct_metas[0] );
-      fd_native_cpi_create_account_meta( lut_key,   0, 1, &acct_metas[1] );
+    // Create signers list
+    fd_pubkey_t signers[16];
+    ulong signers_cnt = 1UL;
+    signers[0]        = *payer_key;
 
-      // Create signers list
-      fd_pubkey_t signers[16];
-      ulong signers_cnt = 1UL;
-      signers[0]        = *payer_key;
-
-      // Create system program instruction
-      uchar instr_data[FD_TXN_MTU];
-      fd_system_program_instruction_t instr = {
-        .discriminant = fd_system_program_instruction_enum_transfer,
-        .inner = {
-          .transfer = required_lamports,
-        }
-      };
-
-      fd_bincode_encode_ctx_t encode_ctx = {
-        .data    = instr_data,
-        .dataend = instr_data + FD_TXN_MTU
-      };
-
-      // This should never fail.
-      int err = fd_system_program_instruction_encode( &instr, &encode_ctx );
-      if( FD_UNLIKELY( err ) ) {
-        return FD_EXECUTOR_INSTR_ERR_FATAL;
+    // Create system program instruction
+    uchar instr_data[FD_TXN_MTU];
+    fd_system_program_instruction_t instr = {
+      .discriminant = fd_system_program_instruction_enum_transfer,
+      .inner = {
+        .transfer = required_lamports,
       }
+    };
 
-      err = fd_native_cpi_native_invoke( ctx,
-                                         &fd_solana_system_program_id,
-                                         instr_data,
-                                         FD_TXN_MTU,
-                                         acct_metas,
-                                         2UL,
-                                         signers,
-                                         signers_cnt );
-      if( FD_UNLIKELY( err ) ) {
-        return err;
-      }
-    } FD_SPAD_FRAME_END;
+    fd_bincode_encode_ctx_t encode_ctx = {
+      .data    = instr_data,
+      .dataend = instr_data + FD_TXN_MTU
+    };
+
+    // This should never fail.
+    int err = fd_system_program_instruction_encode( &instr, &encode_ctx );
+    if( FD_UNLIKELY( err ) ) {
+      return FD_EXECUTOR_INSTR_ERR_FATAL;
+    }
+
+    err = fd_native_cpi_native_invoke( ctx,
+                                       &fd_solana_system_program_id,
+                                       instr_data,
+                                       FD_TXN_MTU,
+                                       acct_metas,
+                                       2UL,
+                                       signers,
+                                       signers_cnt );
+    if( FD_UNLIKELY( err ) ) {
+      return err;
+    }
   }
 
   return FD_EXECUTOR_INSTR_SUCCESS;
@@ -802,7 +803,7 @@ deactivate_lookup_table( fd_exec_instr_ctx_t * ctx ) {
   /* try_borrow_instruction_account => get_index_of_instruction_account_in_transaction */
 
   /* https://github.com/anza-xyz/agave/blob/v2.1.4/programs/address-lookup-table/src/processor.rs#L347-L348 */
-  fd_guarded_borrowed_account_t lut_acct;
+  fd_guarded_borrowed_account_t lut_acct = {0};
   FD_TRY_BORROW_INSTR_ACCOUNT_DEFAULT_ERR_CHECK( ctx, ACC_IDX_LUT, &lut_acct );
 
   /* https://github.com/solana-labs/solana/blob/v1.17.4/programs/address-lookup-table/src/processor.rs#L348-L350 */
@@ -817,13 +818,13 @@ deactivate_lookup_table( fd_exec_instr_ctx_t * ctx ) {
   fd_pubkey_t const * authority_key = NULL;
   /* try_borrow_account => get_index_of_instruction_account_in_transaction */
   /* https://github.com/anza-xyz/agave/blob/v2.1.4/programs/address-lookup-table/src/processor.rs#L354-L355 */
-  fd_guarded_borrowed_account_t authority_acct;
+  fd_guarded_borrowed_account_t authority_acct = {0};
   FD_TRY_BORROW_INSTR_ACCOUNT_DEFAULT_ERR_CHECK( ctx, ACC_IDX_AUTHORITY, &authority_acct );
 
   authority_key = authority_acct.acct->pubkey;
 
   /* https://github.com/solana-labs/solana/blob/v1.17.4/programs/address-lookup-table/src/processor.rs#L356-L359 */
-  if( FD_UNLIKELY( !fd_instr_acc_is_signer_idx( ctx->instr, ACC_IDX_AUTHORITY ) ) ) {
+  if( FD_UNLIKELY( !fd_instr_acc_is_signer_idx( ctx->instr, ACC_IDX_AUTHORITY, NULL ) ) ) {
     fd_log_collector_msg_literal( ctx, "Authority account must be a signer" );
     return FD_EXECUTOR_INSTR_ERR_MISSING_REQUIRED_SIGNATURE;
   }
@@ -910,7 +911,7 @@ close_lookup_table( fd_exec_instr_ctx_t * ctx ) {
   /* try_borrow_instruction_account => get_index_of_instruction_account_in_transaction */
 
   /* https://github.com/anza-xyz/agave/blob/v2.1.4/programs/address-lookup-table/src/processor.rs#L396-L397 */
-  fd_guarded_borrowed_account_t lut_acct;
+  fd_guarded_borrowed_account_t lut_acct = {0};
   FD_TRY_BORROW_INSTR_ACCOUNT_DEFAULT_ERR_CHECK( ctx, ACC_IDX_LUT, &lut_acct );
 
   /* https://github.com/solana-labs/solana/blob/v1.17.4/programs/address-lookup-table/src/processor.rs#L397-L399 */
@@ -925,13 +926,13 @@ close_lookup_table( fd_exec_instr_ctx_t * ctx ) {
   fd_pubkey_t const * authority_key = NULL;
   /* try_borrow_account => get_index_of_instruction_account_in_transaction */
   /* https://github.com/anza-xyz/agave/blob/v2.1.4/programs/address-lookup-table/src/processor.rs#L403-L404 */
-  fd_guarded_borrowed_account_t authority_acct;
+  fd_guarded_borrowed_account_t authority_acct = {0};
   FD_TRY_BORROW_INSTR_ACCOUNT_DEFAULT_ERR_CHECK( ctx, ACC_IDX_AUTHORITY, &authority_acct );
 
   authority_key = authority_acct.acct->pubkey;
 
   /* https://github.com/solana-labs/solana/blob/v1.17.4/programs/address-lookup-table/src/processor.rs#L405-L408 */
-  if( FD_UNLIKELY( !fd_instr_acc_is_signer_idx( ctx->instr, ACC_IDX_AUTHORITY ) ) ) {
+  if( FD_UNLIKELY( !fd_instr_acc_is_signer_idx( ctx->instr, ACC_IDX_AUTHORITY, NULL ) ) ) {
     fd_log_collector_msg_literal( ctx, "Authority account must be a signer" );
     return FD_EXECUTOR_INSTR_ERR_MISSING_REQUIRED_SIGNATURE;
   }
@@ -1026,7 +1027,7 @@ close_lookup_table( fd_exec_instr_ctx_t * ctx ) {
   /* try_borrow_instruction_account => get_index_of_instruction_account_in_transaction */
 
   /* https://github.com/anza-xyz/agave/blob/v2.1.4/programs/address-lookup-table/src/processor.rs#L458-L459 */
-  fd_guarded_borrowed_account_t recipient_acct;
+  fd_guarded_borrowed_account_t recipient_acct = {0};
   FD_TRY_BORROW_INSTR_ACCOUNT_DEFAULT_ERR_CHECK( ctx, ACC_IDX_RECIPIENT, &recipient_acct );
 
   err = fd_borrowed_account_checked_add_lamports( &recipient_acct, withdrawn_lamports );
@@ -1073,34 +1074,36 @@ fd_address_lookup_table_program_execute( fd_exec_instr_ctx_t * ctx ) {
   if( FD_UNLIKELY( instr_data==NULL ) ) {
     return FD_EXECUTOR_INSTR_ERR_INVALID_INSTR_DATA;
   }
+  if( FD_UNLIKELY( instr_data_sz>FD_TXN_MTU ) ) {
+    return FD_EXECUTOR_INSTR_ERR_INVALID_INSTR_DATA;
+  }
 
-  FD_SPAD_FRAME_BEGIN( ctx->txn_ctx->spad ) {
-    /* https://github.com/solana-labs/solana/blob/v1.17.4/programs/address-lookup-table/src/processor.rs#L28 */
-    ulong decoded_sz;
-    fd_addrlut_instruction_t * instr = fd_bincode_decode1_spad(
-        addrlut_instruction, ctx->txn_ctx->spad,
-        instr_data, instr_data_sz,
-        NULL,
-        &decoded_sz );
-    if( FD_UNLIKELY( !instr || decoded_sz > FD_TXN_MTU ) ) {
-      return FD_EXECUTOR_INSTR_ERR_INVALID_INSTR_DATA;
-    }
+  /* https://github.com/solana-labs/solana/blob/v1.17.4/programs/address-lookup-table/src/processor.rs#L28 */
+  uchar instr_mem[ FD_ADDRLUT_INSTR_FOOTPRINT ] __attribute__((aligned(alignof(fd_addrlut_instruction_t))));
+  fd_addrlut_instruction_t * instr = fd_bincode_decode_static(
+      addrlut_instruction,
+      instr_mem,
+      instr_data,
+      instr_data_sz,
+      NULL );
+  if( FD_UNLIKELY( !instr ) ) {
+    return FD_EXECUTOR_INSTR_ERR_INVALID_INSTR_DATA;
+  }
 
-    switch( instr->discriminant ) {
-    case fd_addrlut_instruction_enum_create_lut:
-      return create_lookup_table( ctx, &instr->inner.create_lut );
-    case fd_addrlut_instruction_enum_freeze_lut:
-      return freeze_lookup_table( ctx );
-    case fd_addrlut_instruction_enum_extend_lut:
-      return extend_lookup_table( ctx, &instr->inner.extend_lut );
-    case fd_addrlut_instruction_enum_deactivate_lut:
-      return deactivate_lookup_table( ctx );
-    case fd_addrlut_instruction_enum_close_lut:
-      return close_lookup_table( ctx );
-    default:
-      break;
-    }
-  } FD_SPAD_FRAME_END;
+  switch( instr->discriminant ) {
+  case fd_addrlut_instruction_enum_create_lut:
+    return create_lookup_table( ctx, &instr->inner.create_lut );
+  case fd_addrlut_instruction_enum_freeze_lut:
+    return freeze_lookup_table( ctx );
+  case fd_addrlut_instruction_enum_extend_lut:
+    return extend_lookup_table( ctx, &instr->inner.extend_lut );
+  case fd_addrlut_instruction_enum_deactivate_lut:
+    return deactivate_lookup_table( ctx );
+  case fd_addrlut_instruction_enum_close_lut:
+    return close_lookup_table( ctx );
+  default:
+    break;
+  }
 
   return FD_EXECUTOR_INSTR_SUCCESS;
 }

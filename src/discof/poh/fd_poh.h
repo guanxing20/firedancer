@@ -1,5 +1,5 @@
-#ifndef HEADER_fd_src_discof_poh_h
-#define HEADER_fd_src_discof_poh_h
+#ifndef HEADER_fd_src_discof_poh_fd_poh_h
+#define HEADER_fd_src_discof_poh_fd_poh_h
 
 /* Let's say there was a computer, the "leader" computer, that acted as
    a bank.  Users could send it messages saying they wanted to deposit
@@ -334,7 +334,7 @@
    microblocks from pack, so this upper bound is a coordination
    mechanism so that PoH can progress hashcnts while the slot is active,
    and know that pack will not need those hashcnts later to do mixins. */
-#define MAX_MICROBLOCKS_PER_SLOT (32768UL)
+#define MAX_MICROBLOCKS_PER_SLOT (131072UL)
 
 /* When we are hashing in the background in case a prior leader skips
    their slot, we need to store the result of each tick hash so we can
@@ -467,6 +467,7 @@ fd_poh_join( void *         shpoh,
 void
 fd_poh_reset( fd_poh_t *          poh,
               fd_stem_context_t * stem,
+              long                timestamp,
               ulong               hashcnt_per_tick,
               ulong               ticks_per_slot,
               ulong               tick_duration_ns,
@@ -478,6 +479,9 @@ fd_poh_reset( fd_poh_t *          poh,
 
 int
 fd_poh_have_leader_bank( fd_poh_t const * poh );
+
+int
+fd_poh_hashing_to_leader_slot( fd_poh_t const * poh );
 
 void
 fd_poh_begin_leader( fd_poh_t * poh,
@@ -507,4 +511,4 @@ fd_poh1_mixin( fd_poh_t *          poh,
 
 FD_PROTOTYPES_END
 
-#endif /* HEADER_fd_src_discof_poh_h */
+#endif /* HEADER_fd_src_discof_poh_fd_poh_h */

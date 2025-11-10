@@ -1,5 +1,5 @@
-#ifndef HEADER_fd_src_ballet_pack_fd_pack_h
-#define HEADER_fd_src_ballet_pack_fd_pack_h
+#ifndef HEADER_fd_src_disco_pack_fd_pack_h
+#define HEADER_fd_src_disco_pack_fd_pack_h
 
 /* fd_pack defines methods that prioritizes Solana transactions,
    selecting a subset (potentially all) and ordering them to attempt to
@@ -16,30 +16,6 @@
 
 #define FD_PACK_MAX_BANK_TILES 62UL
 
-/* NOTE: THE FOLLOWING CONSTANTS ARE CONSENSUS CRITICAL AND CANNOT BE
-   CHANGED WITHOUT COORDINATING WITH ANZA. */
-
-/* These are bounds on known limits. Upper bound values are used to
-   calculate memory footprints while lower bounds are used for
-   initializing consensus-dependent logic and invariant checking.  As a
-   leader, it is OK to produce blocks using limits smaller than the
-   active on-chain limits. Replay should always use the correct
-   chain-derived limits.
-
-   The actual limits used by pack may be updated dynamically to some
-   in-bounds value. If there is an anticipated feature activation that
-   changes these limits, the upper bound should be the largest
-   anticipated value while the lower bound should be the current active
-   limit. For Frankendancer, the actual value used for consensus will be
-   retrieved from Agave at runtime. */
-#define FD_PACK_MAX_COST_PER_BLOCK_LOWER_BOUND      (48000000UL)
-#define FD_PACK_MAX_VOTE_COST_PER_BLOCK_LOWER_BOUND (36000000UL)
-#define FD_PACK_MAX_WRITE_COST_PER_ACCT_LOWER_BOUND (12000000UL)
-
-#define FD_PACK_MAX_COST_PER_BLOCK_UPPER_BOUND      (100000000UL) /* simd 0286 */
-#define FD_PACK_MAX_VOTE_COST_PER_BLOCK_UPPER_BOUND ( 36000000UL)
-#define FD_PACK_MAX_WRITE_COST_PER_ACCT_UPPER_BOUND ( FD_PACK_MAX_COST_PER_BLOCK_UPPER_BOUND * 4UL / 10UL ) /* simd 0306 */
-
 #define FD_PACK_FEE_PER_SIGNATURE           (5000UL) /* In lamports */
 
 /* Each block is limited to 32k parity shreds.  We don't want pack to
@@ -50,6 +26,9 @@
 
 /* Optionally allow up to 1M shreds per block for benchmarking. */
 #define LARGER_MAX_DATA_PER_BLOCK  (32UL*FD_SHRED_BATCH_BLOCK_DATA_SZ_MAX)
+
+/* Optionally allow a larger limit for benchmarking */
+#define LARGER_MAX_COST_PER_BLOCK (18UL*FD_PACK_MAX_COST_PER_BLOCK_LOWER_BOUND)
 
 /* ---- End consensus-critical constants */
 
@@ -70,7 +49,6 @@
 
 /* The percentage of the transaction fees that are burned */
 #define FD_PACK_TXN_FEE_BURN_PCT        50UL
-
 
 /* The Solana network and Firedancer implementation details impose
    several limits on what pack can produce.  These limits are grouped in
@@ -120,6 +98,93 @@ struct fd_pack_limits {
 };
 typedef struct fd_pack_limits fd_pack_limits_t;
 
+/* fd_pack_addr_use_t: Used for three distinct purposes:
+    -  to record that an address is in use and can't be used again until
+         certain microblocks finish execution
+    -  to keep track of the cost of all transactions that write to the
+         specified account.
+    -  to keep track of the write cost for accounts referenced by
+         transactions in a bundle and which transactions use which
+         accounts.
+   Making these separate structs might make it more clear, but then
+   they'd have identical shape and result in several fd_map_dynamic sets
+   of functions with identical code.  It doesn't seem like the compiler
+   is very good at merging code like that, so in order to reduce code
+   bloat, we'll just combine them. */
+struct fd_pack_private_addr_use_record {
+  fd_acct_addr_t key; /* account address */
+  union {
+    ulong          _;
+    ulong          in_use_by;  /* Bitmask indicating which banks */
+    ulong          total_cost; /* In cost units/CUs */
+    struct { uint    carried_cost;   /* In cost units */
+             ushort  ref_cnt;        /* In transactions */
+             ushort  last_use_in; }; /* In transactions */
+  };
+};
+typedef struct fd_pack_private_addr_use_record fd_pack_addr_use_t;
+
+/* The point of this array it to keep a simple heap of the top 5
+   writable accounts by cus in a given slot.  If we choose to only
+   updated this heap after execution when CUs are rebated, then we could
+   get away with making the heap exactly 5 elements long, and we would
+   end up with the top 5 writers at the end of the slot.
+
+   Unfortunately, this misses accounts for transactions that aren't
+   rebated (e.g. votes), since we don't rebate 0 cus. Therefore we will
+   also add writers to this heap at schedule time, using the requested
+   CU amount.  Since requested CUs is an upper bound, if we do this
+   while also sizing the heap to exactly 5, then a scheduled transaction
+   might evict a writer that was already rebated and was supposed to end
+   up in the heap.
+
+   To fix this, we'll increase the size of the heap by the maximum
+   amount of in-flight, to-be-rebated transactions which currently is
+   just the number of banks times the number of transactions per
+   microblock, which is currently limited to 5 in the case of bundles.
+
+   If/when the system is redesigned to include more than 5 transactions
+   per microblock, then there is a small chance that the final state of
+   the heap is incorrect. */
+#define FD_PACK_TOP_WRITERS_HEAP_SZ (5*FD_PACK_MAX_BANK_TILES + 5UL + 1UL)
+#define FD_PACK_TOP_WRITERS_CNT (5UL)
+#define FD_PACK_TOP_WRITERS_SORT_BEFORE(writer1,writer2) ( (memcmp( (writer1).key.b, &(uchar[32]){ 0 }, FD_TXN_ACCT_ADDR_SZ ) && (writer1).total_cost>(writer2).total_cost) || !memcmp( (writer2).key.b, &(uchar[32]){ 0 }, FD_TXN_ACCT_ADDR_SZ ))
+
+#define SORT_NAME        fd_pack_writer_cost_sort
+#define SORT_KEY_T       fd_pack_addr_use_t
+#define SORT_BEFORE(a,b) (FD_PACK_TOP_WRITERS_SORT_BEFORE(a,b))
+#define SORT_FN_ATTR     __attribute__((no_sanitize("address", "undefined"))) /* excessive ASan slowdown */
+#include "../../util/tmpl/fd_sort.c"
+
+/* fd_pack_limit_usage_t is used to store the actual per-slot resource
+   utilization.  Each utilization field has a corresponding limit field
+   in fd_pack_limits_t which is greater than or equal to the utilization
+   field. */
+struct fd_pack_limits_usage {
+  ulong block_cost;
+  ulong vote_cost;
+
+  /* Contains the top 5 writers in the block. If there are less than 5
+     writeable accounts, unused slots will have their pubkey zeroed out. */
+  fd_pack_addr_use_t top_write_acct_costs[ FD_PACK_TOP_WRITERS_CNT ];
+  ulong block_data_bytes;
+  ulong microblocks;
+};
+
+typedef struct fd_pack_limits_usage fd_pack_limits_usage_t;
+
+/* fd_pack_smallest: We want to keep track of the smallest transaction
+   in each treap.  That way, if we know the amount of space left in the
+   block is less than the smallest transaction in the heap, we can just
+   skip the heap.  Since transactions can be deleted, etc. maintaining
+   this precisely is hard, but we can maintain a conservative value
+   fairly cheaply.  Since the CU limit or the byte limit can be the one
+   that matters, we keep track of the smallest by both. */
+struct fd_pack_smallest {
+  ulong cus;
+  ulong bytes;
+};
+typedef struct fd_pack_smallest fd_pack_smallest_t;
 
 /* Forward declare opaque handle */
 struct fd_pack_private;
@@ -228,6 +293,22 @@ FD_FN_PURE ulong fd_pack_bank_tile_cnt( fd_pack_t const * pack );
    the limits, all the remaining microblocks in the block will be empty,
    but the call is valid. */
 void fd_pack_set_block_limits( fd_pack_t * pack, fd_pack_limits_t const * limits );
+
+/* fd_pack_get_block_limits: Copies the currently active pack limits
+   into opt_limits, if opt_limits is not NULL.  Copies the current limit
+   utilization in opt_limits_usage, if opt_limits_usage is not NULL.
+
+   Limit utilization is updated both when each transactions is scheduled
+   and when any used resources are rebated. */
+void fd_pack_get_block_limits( fd_pack_t * pack, fd_pack_limits_usage_t * opt_limits_usage, fd_pack_limits_t * opt_limits );
+
+/* Copies the currently smallest pending,
+   non-conflicting, non-vote transaction into opt_pending_smallest iff
+   it is not NULL and the smallest pending vote into opt_vote_smallest
+   iff it is not NULL.  These values are updates any time a new
+   transaction is inserted into the pending treap, or moved from another
+   treap into the pending treap. */
+void fd_pack_get_pending_smallest( fd_pack_t * pack, fd_pack_smallest_t * opt_pending_smallest, fd_pack_smallest_t * opt_votes_smallest );
 
 /* Return values for fd_pack_insert_txn_fini:  Non-negative values
    indicate the transaction was accepted and may be returned in a future
@@ -692,4 +773,5 @@ void * fd_pack_delete( void      * mem  );
 int fd_pack_verify( fd_pack_t * pack, void * scratch );
 
 FD_PROTOTYPES_END
-#endif /* HEADER_fd_src_ballet_pack_fd_pack_h */
+
+#endif /* HEADER_fd_src_disco_pack_fd_pack_h */

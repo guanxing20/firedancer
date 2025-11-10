@@ -1,7 +1,14 @@
 #include "fd_ipecho_client.h"
 #include "fd_ipecho_server.h"
+#include "../genesis/fd_genesi_tile.h"
 #include "../../disco/topo/fd_topo.h"
 #include "../../disco/metrics/fd_metrics.h"
+#include "../../ballet/lthash/fd_lthash.h"
+
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <sys/poll.h>
+
 #include "generated/fd_ipecho_tile_seccomp.h"
 
 struct fd_ipecho_tile_ctx {
@@ -15,7 +22,10 @@ struct fd_ipecho_tile_ctx {
 
   ushort bootstrap_shred_version;
   ushort expected_shred_version;
-  ushort shred_version;
+
+  fd_wksp_t * genesi_in_mem;
+  ulong       genesi_in_chunk0;
+  ulong       genesi_in_wmark;
 };
 
 typedef struct fd_ipecho_tile_ctx fd_ipecho_tile_ctx_t;
@@ -30,9 +40,9 @@ scratch_footprint( fd_topo_tile_t const * tile ) {
   (void)tile;
 
   ulong l = FD_LAYOUT_INIT;
-  l = FD_LAYOUT_APPEND( l, alignof( fd_ipecho_tile_ctx_t ), sizeof( fd_ipecho_tile_ctx_t )       );
-  l = FD_LAYOUT_APPEND( l, fd_ipecho_client_align(),        fd_ipecho_client_footprint()         );
-  l = FD_LAYOUT_APPEND( l, fd_ipecho_server_align(),        fd_ipecho_server_footprint( 1024UL ) );
+  l = FD_LAYOUT_APPEND( l, alignof(fd_ipecho_tile_ctx_t), sizeof(fd_ipecho_tile_ctx_t)         );
+  l = FD_LAYOUT_APPEND( l, fd_ipecho_client_align(),      fd_ipecho_client_footprint()         );
+  l = FD_LAYOUT_APPEND( l, fd_ipecho_server_align(),      fd_ipecho_server_footprint( 1024UL ) );
   return FD_LAYOUT_FINI( l, scratch_align() );
 }
 
@@ -40,10 +50,10 @@ static inline void
 metrics_write( fd_ipecho_tile_ctx_t * ctx ) {
   fd_ipecho_server_metrics_t * metrics = fd_ipecho_server_metrics( ctx->server );
 
-  FD_MGAUGE_SET( IPECHO, CONNECTION_COUNT,         metrics->connection_cnt        );
-  FD_MCNT_SET(   IPECHO, BYTES_READ,               metrics->bytes_read            );
-  FD_MCNT_SET(   IPECHO, BYTES_WRITTEN,            metrics->bytes_written         );
-  FD_MCNT_SET(   IPECHO, CONNECTIONS_CLOSED_OK,    metrics->connections_closed_ok );
+  FD_MGAUGE_SET( IPECHO, CONNECTION_COUNT,         metrics->connection_cnt           );
+  FD_MCNT_SET(   IPECHO, BYTES_READ,               metrics->bytes_read               );
+  FD_MCNT_SET(   IPECHO, BYTES_WRITTEN,            metrics->bytes_written            );
+  FD_MCNT_SET(   IPECHO, CONNECTIONS_CLOSED_OK,    metrics->connections_closed_ok    );
   FD_MCNT_SET(   IPECHO, CONNECTIONS_CLOSED_ERROR, metrics->connections_closed_error );
 }
 
@@ -53,17 +63,18 @@ poll_client( fd_ipecho_tile_ctx_t * ctx,
              int *                  charge_busy ) {
   if( FD_UNLIKELY( !ctx->client ) ) return;
 
-  int result = fd_ipecho_client_poll( ctx->client, &ctx->shred_version, charge_busy );
+  ushort shred_version;
+  int result = fd_ipecho_client_poll( ctx->client, &shred_version, charge_busy );
   if( FD_UNLIKELY( !result ) ) {
-    if( FD_UNLIKELY( ctx->expected_shred_version && ctx->expected_shred_version!=ctx->shred_version ) ) {
+    if( FD_UNLIKELY( ctx->expected_shred_version && ctx->expected_shred_version!=shred_version ) ) {
       FD_LOG_ERR(( "Expected shred version %hu but entrypoint returned %hu",
-                   ctx->expected_shred_version, ctx->shred_version ));
+                   ctx->expected_shred_version, shred_version ));
     }
 
-    FD_LOG_INFO(( "retrieved shred version %hu from entrypoint", ctx->shred_version ));
-    FD_MGAUGE_SET( IPECHO, SHRED_VERSION, ctx->shred_version );
-    fd_stem_publish( stem, 0UL, ctx->shred_version, 0UL, 0UL, 0UL, 0UL, 0UL );
-    fd_ipecho_server_init( ctx->server, ctx->bind_address, ctx->bind_port, ctx->shred_version );
+    FD_LOG_INFO(( "retrieved shred version %hu from entrypoint", shred_version ));
+    FD_MGAUGE_SET( IPECHO, SHRED_VERSION, shred_version );
+    fd_stem_publish( stem, 0UL, shred_version, 0UL, 0UL, 0UL, 0UL, 0UL );
+    fd_ipecho_server_set_shred_version( ctx->server, shred_version );
     ctx->retrieving = 0;
     return;
   } else if( FD_UNLIKELY( -1==result ) ) {
@@ -96,28 +107,38 @@ returnable_frag( fd_ipecho_tile_ctx_t * ctx,
                  ulong                  tsorig,
                  ulong                  tspub,
                  fd_stem_context_t *    stem ) {
-  (void)in_idx;
-  (void)seq;
-  (void)chunk;
-  (void)sz;
-  (void)ctl;
-  (void)tsorig;
-  (void)tspub;
+  (void)in_idx; (void)seq; (void)sig; (void)chunk; (void)sz; (void)ctl; (void)tsorig; (void)tspub;
 
-  FD_TEST( sig && sig<=USHORT_MAX );
-  ctx->shred_version = (ushort)sig;
-  FD_TEST( !ctx->expected_shred_version || ctx->shred_version==ctx->expected_shred_version );
-  FD_MGAUGE_SET( IPECHO, SHRED_VERSION, ctx->shred_version );
-  fd_stem_publish( stem, 0UL, ctx->shred_version, 0UL, 0UL, 0UL, tsorig, fd_frag_meta_ts_comp( fd_tickcount() ) );
-  ctx->retrieving = 0;
-  fd_ipecho_server_init( ctx->server, ctx->bind_address, ctx->bind_port, ctx->shred_version );
+  if( FD_UNLIKELY( sig==GENESI_SIG_BOOTSTRAP_COMPLETED ) ) {
+    uchar const * src = fd_chunk_to_laddr_const( ctx->genesi_in_mem, chunk );
+
+    union {
+      uchar  c[ 32 ];
+      ushort s[ 16 ];
+    } hash;
+
+    fd_memcpy( hash.c, src+sizeof(fd_lthash_value_t), sizeof(fd_hash_t) );
+
+    ushort xor = 0;
+    for( ulong i=0UL; i<16UL; i++ ) xor ^= hash.s[ i ];
+
+    xor = fd_ushort_bswap( xor );
+    xor = fd_ushort_if( xor<USHORT_MAX, (ushort)(xor + 1), USHORT_MAX );
+
+    FD_TEST( xor );
+
+    FD_MGAUGE_SET( IPECHO, SHRED_VERSION, xor );
+    fd_stem_publish( stem, 0UL, xor, 0UL, 0UL, 0UL, tsorig, fd_frag_meta_ts_comp( fd_tickcount() ) );
+    fd_ipecho_server_set_shred_version( ctx->server, xor );
+    ctx->retrieving = 0;
+  }
 
   return 0;
 }
 
 static void
-unprivileged_init( fd_topo_t *      topo,
-                   fd_topo_tile_t * tile ) {
+privileged_init( fd_topo_t *      topo,
+                 fd_topo_tile_t * tile ) {
   void * scratch = fd_topo_obj_laddr( topo, tile->tile_obj_id );
 
   FD_SCRATCH_ALLOC_INIT( l, scratch );
@@ -129,7 +150,6 @@ unprivileged_init( fd_topo_t *      topo,
   ctx->bind_port    = tile->ipecho.bind_port;
 
   ctx->expected_shred_version = tile->ipecho.expected_shred_version;
-  ctx->shred_version = 0U;
 
   ctx->retrieving = 1;
   if( FD_LIKELY( tile->ipecho.entrypoints_cnt ) ) {
@@ -142,10 +162,51 @@ unprivileged_init( fd_topo_t *      topo,
 
   ctx->server = fd_ipecho_server_join( fd_ipecho_server_new( _server, 1024UL ) );
   FD_TEST( ctx->server );
+  fd_ipecho_server_init( ctx->server, ctx->bind_address, ctx->bind_port, ctx->expected_shred_version );
 
   ulong scratch_top = FD_SCRATCH_ALLOC_FINI( l, 1UL );
   if( FD_UNLIKELY( scratch_top > (ulong)scratch + scratch_footprint( tile ) ) )
     FD_LOG_ERR(( "scratch overflow %lu %lu %lu", scratch_top - (ulong)scratch - scratch_footprint( tile ), scratch_top, (ulong)scratch + scratch_footprint( tile ) ));
+}
+
+static void
+unprivileged_init( fd_topo_t *      topo,
+                   fd_topo_tile_t * tile ) {
+  void * scratch = fd_topo_obj_laddr( topo, tile->tile_obj_id );
+
+  FD_SCRATCH_ALLOC_INIT( l, scratch );
+  fd_ipecho_tile_ctx_t * ctx = FD_SCRATCH_ALLOC_APPEND( l, alignof( fd_ipecho_tile_ctx_t ), sizeof( fd_ipecho_tile_ctx_t )       );
+
+  FD_MGAUGE_SET( IPECHO, SHRED_VERSION, tile->ipecho.expected_shred_version );
+
+  /* In some topologies (e.g. firedancer-dev gossip), the ipecho tile
+     has no input links. Guard against dereferencing a missing
+     link/dcache. */
+  if( FD_LIKELY( tile->in_cnt>0UL ) ) {
+    ulong link_id = tile->in_link_id[ 0UL ];
+    void * dcache = topo->links[ link_id ].dcache;
+    ctx->genesi_in_mem    = topo->workspaces[ topo->objs[ topo->links[ link_id ].dcache_obj_id ].wksp_id ].wksp;
+    ctx->genesi_in_chunk0 = fd_dcache_compact_chunk0( ctx->genesi_in_mem, dcache );
+    ctx->genesi_in_wmark  = fd_dcache_compact_wmark ( ctx->genesi_in_mem, dcache, topo->links[ link_id ].mtu );
+  } else {
+    ctx->genesi_in_mem    = NULL;
+    ctx->genesi_in_chunk0 = 0UL;
+    ctx->genesi_in_wmark  = 0UL;
+  }
+}
+
+static ulong
+rlimit_file_cnt( fd_topo_t const *      topo FD_PARAM_UNUSED,
+                 fd_topo_tile_t const * tile ) {
+  /* stderr, logfile, one for each socket() call for up to 16
+     gossip entrypoints (GOSSIP_TILE_ENTRYPOINTS_MAX) for
+     fd_ipecho_client, one for fd_ipecho_server, and up to 1024 for the
+     server's connections.  */
+  return 1UL +                          /* stderr */
+         1UL +                          /* logfile */
+         tile->ipecho.entrypoints_cnt + /* for the client */
+         1UL +                          /* for the server's socket */
+         1024UL;                        /* for the server's connections */;
 }
 
 static ulong
@@ -165,15 +226,26 @@ populate_allowed_fds( fd_topo_t const *      topo,
                       fd_topo_tile_t const * tile,
                       ulong                  out_fds_cnt,
                       int *                  out_fds ) {
-  (void)topo;
-  (void)tile;
 
-  if( FD_UNLIKELY( out_fds_cnt<2UL ) ) FD_LOG_ERR(( "out_fds_cnt %lu", out_fds_cnt ));
+  void * scratch = fd_topo_obj_laddr( topo, tile->tile_obj_id );
+  FD_SCRATCH_ALLOC_INIT( l, scratch );
+  fd_ipecho_tile_ctx_t * ctx = FD_SCRATCH_ALLOC_APPEND( l, alignof(fd_ipecho_tile_ctx_t), sizeof(fd_ipecho_tile_ctx_t) );
+
+  if( FD_UNLIKELY( out_fds_cnt<3UL+tile->ipecho.entrypoints_cnt ) ) FD_LOG_ERR(( "out_fds_cnt %lu", out_fds_cnt ));
 
   ulong out_cnt = 0UL;
   out_fds[ out_cnt++ ] = 2; /* stderr */
   if( FD_LIKELY( -1!=fd_log_private_logfile_fd() ) )
     out_fds[ out_cnt++ ] = fd_log_private_logfile_fd(); /* logfile */
+
+  /* All of the fds managed by the client. */
+  for( ulong i=0UL; i<tile->ipecho.entrypoints_cnt; i++ ) {
+    int fd = fd_ipecho_client_get_pollfds( ctx->client )[ i ].fd;
+    if( FD_LIKELY( fd!=-1 ) ) out_fds[ out_cnt++ ] = fd;
+  }
+
+  /* The server's socket. */
+  out_fds[ out_cnt++ ] = fd_ipecho_server_sockfd( ctx->server );
   return out_cnt;
 }
 
@@ -191,10 +263,14 @@ populate_allowed_fds( fd_topo_t const *      topo,
 
 fd_topo_run_tile_t fd_tile_ipecho = {
   .name                     = "ipecho",
+  .rlimit_file_cnt_fn       = rlimit_file_cnt,
   .populate_allowed_seccomp = populate_allowed_seccomp,
   .populate_allowed_fds     = populate_allowed_fds,
   .scratch_align            = scratch_align,
   .scratch_footprint        = scratch_footprint,
+  .privileged_init          = privileged_init,
   .unprivileged_init        = unprivileged_init,
   .run                      = stem_run,
+  .allow_connect            = 1,
+  .keep_host_networking     = 1
 };

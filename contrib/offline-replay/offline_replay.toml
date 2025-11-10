@@ -8,7 +8,6 @@
         rocksdb_path = "{ledger}/rocksdb"
     [tiles.replay]
         cluster_version = "{cluster_version}"
-        heap_size_gib = {heap_size}
     [tiles.gui]
         enabled = false
 [funk]
@@ -16,16 +15,10 @@
     max_account_records = {index_max}
     max_database_transactions = 64
 [runtime]
-    max_total_banks = 4
+    max_live_slots = 4
     max_fork_width = 4
-[blockstore]
-    shred_max = 16777216
-    block_max = 8192
-    txn_max = 1048576
-    alloc_max = 10737418240
-    file = "{ledger}/backtest.blockstore"
-[consensus]
-    vote = false
+    [runtime.program_cache]
+        heap_size_mib = 4096
 [development]
     sandbox = false
     no_agave = true
@@ -35,12 +28,13 @@
     path = "{log}"
 [paths]
     snapshots = "{ledger}"
-[hugetlbfs]
-    mount_path = "/data/firedancer/mnt"
 [snapshots]
     incremental_snapshots = false
-    minimum_download_speed_mib = 0
-    maximum_local_snapshot_age = 0
-    maximum_download_retry_abort = 0
+    max_full_snapshots_to_keep = 5
+    [snapshots.sources]
+        servers = []
+        [snapshots.sources.gossip]
+            allow_any = false
+            allow_list = []
 [gossip]
     entrypoints = [ "0.0.0.0:1" ]

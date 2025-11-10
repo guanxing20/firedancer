@@ -1,8 +1,8 @@
-#include "../tiles.h"
 
+#include "../fd_txn_m.h"
 #include "generated/fd_dedup_tile_seccomp.h"
 
-#include "../verify/fd_verify_tile.h"
+#include "../topo/fd_topo.h"
 #include "../metrics/fd_metrics.h"
 
 #include <linux/unistd.h>
@@ -122,7 +122,7 @@ during_frag( fd_dedup_ctx_t * ctx,
     if( FD_UNLIKELY( sz!=FD_TXN_SIGNATURE_SZ ) ) FD_LOG_ERR(( "received an executed transaction signature message with the wrong size %lu", sz ));
     /* Executed txns just have their signature inserted into the tcache
        so we can dedup them easily. */
-    ulong ha_dedup_tag = fd_hash( ctx->hashmap_seed, src+FD_TXN_SIGNATURE_SZ, FD_TXN_SIGNATURE_SZ );
+    ulong ha_dedup_tag = fd_hash( ctx->hashmap_seed, src, FD_TXN_SIGNATURE_SZ );
     int _is_dup;
     FD_TCACHE_INSERT( _is_dup, *ctx->tcache_sync, ctx->tcache_ring, ctx->tcache_depth, ctx->tcache_map, ctx->tcache_map_cnt, ha_dedup_tag );
     (void)_is_dup;
@@ -263,6 +263,8 @@ unprivileged_init( fd_topo_t *      topo,
     } else if( !strcmp( link->name, "verify_dedup" ) ) {
       ctx->in_kind[ i ] = IN_KIND_VERIFY;
     } else if( !strcmp( link->name, "executed_txn" ) ) {
+      ctx->in_kind[ i ] = IN_KIND_EXECUTED_TXN;
+    } else if( !strcmp( link->name, "exec_sig" ) ) {
       ctx->in_kind[ i ] = IN_KIND_EXECUTED_TXN;
     } else {
       FD_LOG_ERR(( "unexpected link name %s", link->name ));

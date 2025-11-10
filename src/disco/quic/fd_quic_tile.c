@@ -152,14 +152,14 @@ metrics_write( fd_quic_ctx_t * ctx ) {
 
   FD_MCNT_ENUM_COPY( QUIC, PKT_CRYPTO_FAILED,   ctx->quic->metrics.pkt_decrypt_fail_cnt );
   FD_MCNT_ENUM_COPY( QUIC, PKT_NO_KEY,          ctx->quic->metrics.pkt_no_key_cnt );
-  FD_MCNT_SET(       QUIC, PKT_NO_CONN,         ctx->quic->metrics.pkt_no_conn_cnt );
+  FD_MCNT_ENUM_COPY( QUIC, PKT_NO_CONN,         ctx->quic->metrics.pkt_no_conn_cnt );
   FD_MCNT_ENUM_COPY( QUIC, FRAME_TX_ALLOC,        ctx->quic->metrics.frame_tx_alloc_cnt );
   FD_MCNT_SET(       QUIC, PKT_NET_HEADER_INVALID,  ctx->quic->metrics.pkt_net_hdr_err_cnt );
   FD_MCNT_SET(       QUIC, PKT_QUIC_HEADER_INVALID, ctx->quic->metrics.pkt_quic_hdr_err_cnt );
   FD_MCNT_SET(       QUIC, PKT_UNDERSZ,         ctx->quic->metrics.pkt_undersz_cnt );
   FD_MCNT_SET(       QUIC, PKT_OVERSZ,          ctx->quic->metrics.pkt_oversz_cnt );
   FD_MCNT_SET(       QUIC, PKT_VERNEG,          ctx->quic->metrics.pkt_verneg_cnt );
-  FD_MCNT_SET(       QUIC, PKT_RETRANSMISSIONS, ctx->quic->metrics.pkt_retransmissions_cnt );
+  FD_MCNT_ENUM_COPY( QUIC, PKT_RETRANSMISSIONS, ctx->quic->metrics.pkt_retransmissions_cnt );
   FD_MCNT_ENUM_COPY( QUIC, INITIAL_TOKEN_LEN,   ctx->quic->metrics.initial_token_len_cnt );
 
   FD_MCNT_SET(   QUIC, HANDSHAKES_CREATED,         ctx->quic->metrics.hs_created_cnt );

@@ -1,9 +1,12 @@
-#ifndef HEADER_fd_src_discof_fd_poh_tile_h
-#define HEADER_fd_src_discof_fd_poh_tile_h
+#ifndef HEADER_fd_src_discof_poh_fd_poh_tile_h
+#define HEADER_fd_src_discof_poh_fd_poh_tile_h
 
 #include "../../util/fd_util_base.h"
 
 struct fd_poh_reset {
+  ulong bank_idx;
+
+  long  timestamp;
   ulong completed_slot;
   uchar completed_blockhash[ 32UL ];
   ulong hashcnt_per_tick;
@@ -23,4 +26,4 @@ struct fd_poh_begin_leader {
 
 typedef struct fd_poh_begin_leader fd_poh_begin_leader_t;
 
-#endif /* HEADER_fd_src_discof_fd_poh_tile_h */
+#endif /* HEADER_fd_src_discof_poh_fd_poh_tile_h */

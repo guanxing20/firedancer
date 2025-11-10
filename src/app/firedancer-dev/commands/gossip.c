@@ -86,8 +86,8 @@ fd_gossip_subtopo( config_t * config, ulong tile_to_cpu[ FD_TILE_MAX ] FD_PARAM_
     fd_topo_tile_t * gossvf_tile = fd_topob_tile( topo, "gossvf", "gossvf", "metric_in", 0UL, 0, 1 );
     strncpy( gossvf_tile->gossvf.identity_key_path, config->paths.identity_key, sizeof(gossvf_tile->gossvf.identity_key_path) );
     gossvf_tile->gossvf.tcache_depth = 1UL<<22UL;
-    gossvf_tile->gossvf.shred_version = 0;
-    gossvf_tile->gossvf.allow_private_address = 0;
+    gossvf_tile->gossvf.shred_version = config->consensus.expected_shred_version;
+    gossvf_tile->gossvf.allow_private_address = config->development.gossip.allow_private_address;
     gossvf_tile->gossvf.entrypoints_cnt = config->gossip.entrypoints_cnt;
     gossvf_tile->gossvf.boot_timestamp_nanos = config->boot_timestamp_nanos;
     for( ulong i=0UL; i<config->gossip.entrypoints_cnt; i++ ) {
@@ -165,7 +165,7 @@ configure_args( void ) {
   args.configure.stages[ stage_idx++ ] = &fd_cfg_stage_hugetlbfs;
   args.configure.stages[ stage_idx++ ] = &fd_cfg_stage_sysctl;
   args.configure.stages[ stage_idx++ ] = &fd_cfg_stage_ethtool_channels;
-  args.configure.stages[ stage_idx++ ] = &fd_cfg_stage_ethtool_gro;
+  args.configure.stages[ stage_idx++ ] = &fd_cfg_stage_ethtool_offloads;
   args.configure.stages[ stage_idx++ ] = &fd_cfg_stage_ethtool_loopback;
   args.configure.stages[ stage_idx++ ] = NULL;
 
@@ -762,6 +762,7 @@ gossip_cmd_fn( args_t *   args,
   printf("Found %lu gossvf tiles\n", gossvf_tiles.tile_count);
 
   ulong net_tile_idx = fd_topo_find_tile( &config->topo, "net", 0UL );
+  if ( net_tile_idx==ULONG_MAX ) net_tile_idx = fd_topo_find_tile( &config->topo, "sock", 0UL );
   FD_TEST( net_tile_idx!=ULONG_MAX );
   fd_topo_tile_t * net_tile = &config->topo.tiles[ net_tile_idx ];
 

@@ -9,14 +9,13 @@ so Firedancer can run correctly. It does the following:
 * **hyperthreads** Checks hyperthreaded pair for critical CPU cores.
 * **ethtool-channels** Configures the number of channels on the network
 device.
-* **ethtool-gro** Disable generic-receive-offload (GRO) on the network
-device.
+* **ethtool-offloads** Modify offload feature flags on the network device.
 * **ethtool-loopback** Disable tx-udp-segmentation on the loopback
 device.
 
 The `hugetlbfs` configuration must be performed every time the system
 is rebooted, to remount the `hugetlbfs` filesystems, as do `sysctl`,
-`ethtool-channels` and `ethtool-gro` to reconfigure the networking
+`ethtool-channels` and `ethtool-offloads` to reconfigure the networking
 device.
 
 The configure command is run like `fdctl configure <mode> <stage>...`
@@ -30,9 +29,9 @@ where `mode` is one of:
  - `fini` Unconfigure (reverse) the stage if it is reversible.
 
 `stage` can be one or more of `hugetlbfs`, `sysctl`, `hyperthreads`,
-`ethtool-channels`, `ethtool-gro`, `ethtool-loopback`, and `snapshots`
-and these stages are described below. You can also use the stage `all`
-which will configure everything.
+`ethtool-channels`, `ethtool-offloads`, `ethtool-loopback`, and
+`snapshots` and these stages are described below. You can also use the
+stage `all` which will configure everything.
 
 Stages have different privilege requirements, which you can see by
 trying to run the stage without privileges. The `check` mode never
@@ -148,17 +147,34 @@ See the [kernel
 documentation](https://docs.kernel.org/networking/scaling.html) for more
 information.
 
-In Firedancer, each `net` tile serves one network queue, so the
-`ethtool-channels` stage will modify the combined channel count of the
-configured network device `[net.interface]` to be the same as the number
-of `net` tiles, `[layout.net_tile_count]`. If your NIC does not support
-the required number of queues, you will need to reduce the number of
-`net` tiles, potentially down to one for NICs which don't support queues
-at all.
+In Firedancer, each `net` tile serves just one network queue, so the
+`ethtool-channels` stage will modify the network device `[net.interface]`
+configuration such that all packets needed by Firedancer are steered to
+the proper queue(s).  There are three modes, selectable in your
+configuration, that govern this behavior:
 
-The command run by the stage is similar to running `ethtool
---set-channels <device> combined <N>` but it also supports bonded
-devices. We can check that it worked:
+ * **simple** mode modifies the combined channel count of the configured
+network device to be the same as the number of `net` tiles,
+`[layout.net_tile_count]`. If your NIC does not support the required
+number of queues, you will need to reduce the number of `net` tiles,
+potentially down to one for NICs which don't support queues at all.  This
+is the default mode and should work for all network devices.  Because
+the queue count is reduced system-wide, not solely for Firedancer, this
+can have a negative performance impact on non-Firedancer network traffic.
+
+ * **dedicated** mode reserves a dedicated hardware queue for each `net`
+tile.  This is the more advanced mode and may not work with all network
+devices.  By modifying the RXFH indirection table and installing ntuple
+rules, Firedancer traffic is directed onto the dedicated queues and all
+other traffic is sharded amongst the rest.  This has a performance
+benefit for both Firedancer and non-Firedancer traffic.
+
+ * **auto** mode attempts to initialize the device in dedicated mode
+and automatically falls back to simple mode if any failure occurs.
+
+The command run by the stage in simple mode is similar to running
+`ethtool --set-channels <device> combined <N>` but it also supports
+bonded devices. We can check that it worked:
 
 <<< @/snippets/ethtool-channels.ansi
 
@@ -166,24 +182,25 @@ The stage only needs to be run once after boot but before running
 Firedancer. It has no dependencies on any other stage, although it is
 dependent on the number of `net` tiles in your configuration.
 
-Changing device settings with `ethtool-channels` requires root privileges, and
-cannot be performed with capabilities.
+Changing device settings with `ethtool-channels` requires root
+privileges, and cannot be performed with capabilities.
 
-## ethtool-gro
+## ethtool-offloads
 XDP is incompatible with a feature of network devices called
-`generic-receive-offload`. This feature must be disabled for Firedancer
-to work.
+`rx-udp-gro-forwarding`. This feature must be disabled for Firedancer
+to work. GRE segmentation offload is also disabled.
 
-The command run by the stage is similar to running `ethtool --offload <device> generic-receive-offload off`
-but it also supports bonded devices. We can check that it worked:
+The command run by the stage is similar to running
+`ethtool --offload <device> <offload> off` but it also supports bonded
+devices. We can check that it worked:
 
-<<< @/snippets/ethtool-gro.ansi
+<<< @/snippets/ethtool-offloads.ansi
 
 The stage only needs to be run once after boot but before running
 Firedancer. It has no dependencies on any other stage.
 
-Changing device settings with `ethtool-gro` requires root privileges, and
-cannot be performed with capabilities.
+Changing device settings with `ethtool-offloads` requires root
+privileges, and cannot be performed with capabilities.
 
 ## ethtool-loopback
 XDP is incompatible with localhost UDP traffic using a feature called

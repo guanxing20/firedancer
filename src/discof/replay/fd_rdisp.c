@@ -71,16 +71,14 @@
    and so they don't have globally acceptable type names (e.g.
    fd_rdisp_edge_t). */
 
-/* Everything is set up to allow this to be 128, but we can save the
-   space until it's necessary. */
-#define MAX_ACCT_PER_TXN 64UL
+#define MAX_ACCT_PER_TXN 128UL
 
 /* edge_t: Fields typed edge_t represent an edge in one of the parallel
    account-conflict DAGs.  Each transaction stores a list of all its
    outgoing edges.  The type is actually a union of bitfield, but C
    bitfields are gross, so we just do it manually with macros.  If the
    high bit is set, that means the transaction storing this edge_t value
-   is it the last in this specific DAG, and the lower 31 bits of the
+   is the last in this specific DAG, and the lower 31 bits of the
    value are an index in the map_pool for the account pubkey for this
    DAG.  See the comments about the hidden edge outgoing from node 7 in
    the DAG at the top of this file for an example.
@@ -108,14 +106,25 @@
 typedef uint edge_t;
 
 
-/* txn_node_t is the representation of a transaction as a node in the
+/* fd_rdisp_txn is the representation of a transaction as a node in the
    DAG. */
 struct fd_rdisp_txn {
-  /* in_degree: in the worst case, all the other transactions in the
-     pool read from each of the max number of accounts that this
-     transaction writes to,  so there are MAX_ACCT_LOCKS*depth edges
-     that come into this node, which is less than UINT_MAX.  If
-     in_degree == UINT_MAX, it means the transaction is not staged. */
+  /* in_degree: The total number of edges summed across all account DAGs
+     with this node as their destination.  In the worst case, all the
+     other transactions in the pool read from each of the max number of
+     accounts that this transaction writes to,  so there are
+     MAX_ACCT_PER_TXN*depth edges that come into this node, which fits in
+     about 30 bits, so we have some room for special values.  If
+     in_degree is one of the following values, then
+     the transaction is: */
+#define IN_DEGREE_FREE                (UINT_MAX   )
+#define IN_DEGREE_UNSTAGED            (UINT_MAX-1U)/* unstaged, not dispatched */
+#define IN_DEGREE_DISPATCHED          (UINT_MAX-2U)/* staged,   dispatched */
+#define IN_DEGREE_UNSTAGED_DISPATCHED (UINT_MAX-3U)/* unstaged, dispatched */
+#define IN_DEGREE_ZOMBIE              (UINT_MAX-4U)/* zombie */
+  /* a transaction that is staged and dispatched is must have an
+     in_degree of 0.  in_degree isn't a meaningful concept for unstaged
+     transactions. */
   uint    in_degree;
 
   /* score: integer part stores how many transactions in the block must
@@ -146,6 +155,9 @@ struct fd_rdisp_txn {
        time, so there's no conflict with storage there either. */
     uint unstaged_next;
     uint free_next;
+    /* If ZOMBIE, pointer back to block is here.  No storage conflict
+       because ZOMBIE is an exclusive state. */
+    uint block_idx;
   };
 
 
@@ -213,16 +225,23 @@ typedef struct fd_rdisp_txn fd_rdisp_txn_t;
 #define SLIST_NEXT  unstaged_next
 #include "../../util/tmpl/fd_slist.c"
 
+#define DLIST_IDX_T uint
+#define DLIST_PREV  edges[0]
+#define DLIST_NEXT  edges[1]
+#define DLIST_NAME  zombie_dlist
+#define DLIST_ELE_T fd_rdisp_txn_t
+#include "../../util/tmpl/fd_dlist.c"
+
 
 /* ACCT_INFO_FLAG: It's a bit unfortunate that we have to maintain these
    flags, but basically we need to be able to distinguish the case where
    there are only readers so that we don't increment in_degree when
-   adding a new txn_node.  If we have any writers, the only way to
+   adding a new fd_rdisp_txn.  If we have any writers, the only way to
    transition into a state where there are only readers is to complete
    the last writer.  We know we are in this case when the completed
    node's child doesn't have a child, and the completed node's child is
    a reader, as indicated by the LAST_REF_WAS_WRITE bit.
-   LAST_REFERENCE_WAS_WRITE also has the advantage of being easy to
+   LAST_REF_WAS_WRITE also has the advantage of being easy to
    maintain. */
 #define ACCT_INFO_FLAG_LAST_REF_WAS_WRITE(lane) (((uchar)1)<<(2*(lane)))
 #define ACCT_INFO_FLAG_ANY_WRITERS(       lane) (((uchar)2)<<(2*(lane)))
@@ -373,6 +392,7 @@ struct fd_rdisp_blockinfo {
   uint map_chain_next;
   uint ll_next;
   unstaged_txn_ll_t ll[ 1 ]; /* used only when unstaged */
+  zombie_dlist_t    zombie_list[ 1 ];
 };
 typedef struct fd_rdisp_blockinfo fd_rdisp_blockinfo_t;
 
@@ -473,7 +493,8 @@ ulong fd_rdisp_align( void ) { return 128UL; }
 ulong
 fd_rdisp_footprint( ulong depth,
                     ulong block_depth ) {
-  if( FD_UNLIKELY( (depth>FD_RDISP_MAX_DEPTH) | (block_depth>FD_RDISP_MAX_BLOCK_DEPTH) ) ) return 0UL;
+  if( FD_UNLIKELY( (depth>FD_RDISP_MAX_DEPTH)             | (depth<2UL) |
+                   (block_depth>FD_RDISP_MAX_BLOCK_DEPTH) | (block_depth<4UL) ) ) return 0UL;
 
   ulong chain_cnt      = block_map_chain_cnt_est( block_depth );
   ulong acct_depth     = depth*MAX_ACCT_PER_TXN;
@@ -497,7 +518,8 @@ fd_rdisp_new( void * mem,
               ulong  depth,
               ulong  block_depth,
               ulong  seed ) {
-  if( FD_UNLIKELY( (depth>FD_RDISP_MAX_DEPTH) | (block_depth>FD_RDISP_MAX_BLOCK_DEPTH) ) ) return NULL;
+  if( FD_UNLIKELY( (depth>FD_RDISP_MAX_DEPTH)             | (depth<2UL) |
+                   (block_depth>FD_RDISP_MAX_BLOCK_DEPTH) | (block_depth<4UL) ) ) return 0UL;
 
   ulong chain_cnt      = block_map_chain_cnt_est( block_depth );
   ulong acct_depth     = depth*MAX_ACCT_PER_TXN;
@@ -520,11 +542,18 @@ fd_rdisp_new( void * mem,
   disp->global_insert_cnt = 0UL;
   disp->unstaged_lblk_num = 0UL;
 
-  pool_new( _pool, depth+1UL );
+  fd_rdisp_txn_t * temp_pool_join = pool_join( pool_new( _pool, depth+1UL ) );
+  for( ulong i=0UL; i<depth+1UL; i++ ) temp_pool_join[ i ].in_degree = IN_DEGREE_FREE;
+  pool_leave( temp_pool_join );
+
   memset( _unstaged, '\0', sizeof(fd_rdisp_unstaged_t)*(depth+1UL) );
 
   block_map_new ( _bmap,  chain_cnt, seed );
   block_pool_new( _bpool, block_depth+1UL );
+
+  fd_rdisp_blockinfo_t * bpool_temp_join = block_pool_join( _bpool );
+  for( ulong i=0UL; i<block_depth+1UL; i++ ) zombie_dlist_new( bpool_temp_join[ i ].zombie_list );
+  block_pool_leave( bpool_temp_join );
 
   disp->free_lanes = 0xF;
   for( ulong i=0UL; i<4UL; i++ ) {
@@ -576,6 +605,8 @@ fd_rdisp_join( void * mem ) {
   disp->unstaged   = (fd_rdisp_unstaged_t *)_unstaged;
   disp->blockmap   = block_map_join( _bmap );
   disp->block_pool = block_pool_join( _bpool );
+
+  for( ulong i=0UL; i<block_depth+1UL; i++ ) zombie_dlist_join( disp->block_pool[ i ].zombie_list );
 
   for( ulong i=0UL; i<4UL; i++ ) {
     disp->lanes[i].pending = pending_prq_join( _pending );
@@ -674,7 +705,7 @@ fd_rdisp_add_block( fd_rdisp_t          * disp,
 
 int
 fd_rdisp_remove_block( fd_rdisp_t          * disp,
-                       FD_RDISP_BLOCK_TAG_T   block_tag ) {
+                       FD_RDISP_BLOCK_TAG_T  block_tag ) {
   fd_rdisp_blockinfo_t * block_pool = disp->block_pool;
 
   fd_rdisp_blockinfo_t * block   = block_map_ele_query( disp->blockmap, &block_tag, NULL, block_pool );
@@ -682,6 +713,7 @@ fd_rdisp_remove_block( fd_rdisp_t          * disp,
 
   FD_TEST( block->schedule_ready );
   FD_TEST( block->completed_cnt==block->inserted_cnt );
+  FD_TEST( zombie_dlist_is_empty( block->zombie_list, disp->pool ) );
 
   if( FD_LIKELY( block->staged ) ) {
     ulong staging_lane = (ulong)block->staging_lane;
@@ -702,7 +734,7 @@ fd_rdisp_remove_block( fd_rdisp_t          * disp,
 
 int
 fd_rdisp_abandon_block( fd_rdisp_t          * disp,
-                        FD_RDISP_BLOCK_TAG_T   block_tag ) {
+                        FD_RDISP_BLOCK_TAG_T  block_tag ) {
   fd_rdisp_blockinfo_t * block_pool = disp->block_pool;
 
   fd_rdisp_blockinfo_t * block   = block_map_ele_query( disp->blockmap, &block_tag, NULL, disp->block_pool );
@@ -715,7 +747,10 @@ fd_rdisp_abandon_block( fd_rdisp_t          * disp,
        READY */
     ulong txn = fd_rdisp_get_next_ready( disp, block_tag );
     FD_TEST( txn );
-    fd_rdisp_complete_txn( disp, txn );
+    fd_rdisp_complete_txn( disp, txn, 1 );
+  }
+  while( !zombie_dlist_is_empty( block->zombie_list, disp->pool ) ) {
+    fd_rdisp_complete_txn( disp, zombie_dlist_idx_pop_head( block->zombie_list, disp->pool ), 1 );
   }
 
   if( FD_LIKELY( block->staged ) ) {
@@ -776,7 +811,7 @@ fd_rdisp_promote_block( fd_rdisp_t *          disp,
 
     fd_rdisp_txn_t      * ele = unstaged_txn_ll_iter_ele( iter, block->ll, disp->pool );
     fd_rdisp_unstaged_t * uns = disp->unstaged + unstaged_txn_ll_iter_idx( iter, block->ll, disp->pool );
-    FD_TEST( ele->in_degree==UINT_MAX );
+    FD_TEST( ele->in_degree==IN_DEGREE_UNSTAGED );
 
     ele->in_degree    = 0U;
     ele->edge_cnt_etc = 0U;
@@ -1089,11 +1124,12 @@ fd_rdisp_add_txn( fd_rdisp_t          *  disp,
 
   ulong idx = pool_idx_acquire( disp->pool );
   fd_rdisp_txn_t * rtxn = disp->pool + idx;
+  if( FD_UNLIKELY( rtxn->in_degree!=IN_DEGREE_FREE ) ) FD_LOG_CRIT(( "pool[%lu].in_degree==%u but free", idx, rtxn->in_degree ));
 
   fd_acct_addr_t const * imm_addrs = fd_txn_get_acct_addrs( txn, payload );
 
   if( FD_UNLIKELY( !block->staged ) ) {
-    rtxn->in_degree = UINT_MAX;
+    rtxn->in_degree = IN_DEGREE_UNSTAGED;
     rtxn->score     = 0.999f;
 
     fd_rdisp_unstaged_t * unstaged = disp->unstaged + idx;
@@ -1174,10 +1210,12 @@ fd_rdisp_get_next_ready( fd_rdisp_t           * disp,
     if( FD_UNLIKELY( l->pending->score>=(float)(block->completed_cnt+1U)           ) ) return 0UL;
     idx = l->pending->txn_idx;
     pending_prq_remove_min( l->pending );
+    disp->pool[ idx ].in_degree = IN_DEGREE_DISPATCHED;
   } else {
     if( FD_UNLIKELY( block->dispatched_cnt!=block->completed_cnt       ) ) return 0UL;
     if( FD_UNLIKELY( unstaged_txn_ll_is_empty( block->ll, disp->pool ) ) ) return 0UL;
     idx = unstaged_txn_ll_idx_peek_head( block->ll, disp->pool );
+    disp->pool[ idx ].in_degree = IN_DEGREE_UNSTAGED_DISPATCHED;
   }
   block->dispatched_cnt++;
 
@@ -1186,21 +1224,24 @@ fd_rdisp_get_next_ready( fd_rdisp_t           * disp,
 
 void
 fd_rdisp_complete_txn( fd_rdisp_t * disp,
-                       ulong        txn_idx ) {
+                       ulong        txn_idx,
+                       int          reclaim ) {
 
   fd_rdisp_txn_t * rtxn = disp->pool + txn_idx;
+  fd_rdisp_blockinfo_t * block = NULL;
 
-  if( FD_UNLIKELY( rtxn->in_degree==UINT_MAX ) ) {
+  if( FD_UNLIKELY( rtxn->in_degree==IN_DEGREE_UNSTAGED_DISPATCHED ) ) {
     /* Unstaged */
-    fd_rdisp_blockinfo_t * block = block_map_ele_query( disp->blockmap, &disp->unstaged[ txn_idx ].block, NULL, disp->block_pool );
+    block = block_map_ele_query( disp->blockmap, &disp->unstaged[ txn_idx ].block, NULL, disp->block_pool );
     FD_TEST( rtxn==unstaged_txn_ll_ele_peek_head( block->ll, disp->pool ) );
     unstaged_txn_ll_ele_pop_head( block->ll, disp->pool );
     block->completed_cnt++;
-  } else {
+  } else if( FD_LIKELY( rtxn->in_degree==IN_DEGREE_DISPATCHED ) ) {
     /* Staged */
     ulong w_cnt = (rtxn->edge_cnt_etc    ) & 0x7FU;
     ulong r_cnt = (rtxn->edge_cnt_etc>> 7) & 0x7FU;
     ulong lane  = (rtxn->edge_cnt_etc>>14) & 0x3U;
+    uint  tail_linear_block_num = (uint)(disp->lanes[lane].linear_block_number);
     ulong edge_idx = 0UL;
     for( ulong i=0UL; i<w_cnt+r_cnt; i++ ) {
       edge_t const * e = rtxn->edges+edge_idx;
@@ -1224,8 +1265,10 @@ fd_rdisp_complete_txn( fd_rdisp_t * disp,
            didn't exist, we need to check if it's the last one
            (me==me->next).  If so, we can clear last_reference.  If not,
            we need to delete this node from the linked list */
-        if( edge_idx<w_cnt || e[1]==ref_to_me ) ai->last_reference[ lane ] = 0U;
-        else {
+        if( edge_idx<w_cnt || e[1]==ref_to_me ) {
+          ai->last_reference[ lane ] = 0U;
+          ai->flags = (uchar)(ai->flags & (~(ACCT_INFO_FLAG_ANY_WRITERS( lane ) | ACCT_INFO_FLAG_LAST_REF_WAS_WRITE( lane ))));
+        } else {
           int _ignore;
           FOLLOW_EDGE( disp->pool, e[1], _ignore )[2] = e[2];  /* me->next->prev = me->prev */
           FOLLOW_EDGE( disp->pool, e[2], _ignore )[1] = e[1];  /* me->prev->next = me->next */
@@ -1252,10 +1295,25 @@ fd_rdisp_complete_txn( fd_rdisp_t * disp,
              and the second child_txn is F. */
           /*            */ child_edge = FOLLOW_EDGE(     disp->pool, next_e, child_is_writer );
           fd_rdisp_txn_t * child_txn  = FOLLOW_EDGE_TXN( disp->pool, next_e                  );
-          FD_TEST( child_txn->in_degree>0U );
+
+          /* Sanity test */
+          FD_TEST( child_txn->in_degree>0U                   );
+          FD_TEST( child_txn->in_degree<IN_DEGREE_DISPATCHED );
+
           if( FD_UNLIKELY( 0U==(--(child_txn->in_degree)) ) ) {
+            /* We need an operation something like
+               fd_frag_meta_ts_decomp. child_txn has the low 16 bits,
+               and tail_linear_block_num has the full 32 bits, except
+               for tail_linear_block_num refers to a block < block_depth
+               later.  Since block_depth<2^16, that means we can resolve
+               this unambiguously.  Basically, we copy the high 16 bits
+               frorm tail_linear_block_num unless that would make
+               linear_block_num larger than tail_linear_block_num, in
+               which case, we subtract 2^16. */
+            uint low_16_bits = child_txn->edge_cnt_etc>>16;
+            uint linear_block_num = ((tail_linear_block_num & ~0xFFFFU) | low_16_bits) - (uint)((low_16_bits>(tail_linear_block_num&0xFFFFU))<<16);
             pending_prq_ele_t temp[1] = {{ .score               = child_txn->score,
-                                           .linear_block_number = child_txn->edge_cnt_etc>>16,
+                                           .linear_block_number = linear_block_num,
                                            .txn_idx             = (uint)(child_txn-disp->pool) }};
             pending_prq_insert( disp->lanes[ lane ].pending, temp );
           }
@@ -1312,7 +1370,7 @@ fd_rdisp_complete_txn( fd_rdisp_t * disp,
              there is one, it is the last reference.
 
              Either way, we want to set ANY_WRITERS to
-             LAST_REF_WAS_WRITER. */
+             LAST_REF_WAS_WRITE. */
           acct_info_t * ai = disp->acct_pool + (*child_edge & 0x7FFFFFFFU);
           ulong flags = ai->flags;
           flags &= ~(ulong)ACCT_INFO_FLAG_ANY_WRITERS( lane );
@@ -1322,12 +1380,27 @@ fd_rdisp_complete_txn( fd_rdisp_t * disp,
       }
       edge_idx += fd_ulong_if( i<w_cnt, 1UL, 3UL );
     }
-    block_slist_ele_peek_head( disp->lanes[ lane ].block_ll, disp->block_pool )->completed_cnt++;
+    block = block_slist_ele_peek_head( disp->lanes[ lane ].block_ll, disp->block_pool );
+    block->completed_cnt++;
+  } else if( FD_LIKELY( rtxn->in_degree==IN_DEGREE_ZOMBIE ) ) {
+    FD_TEST( reclaim );
+    block = block_pool_ele( disp->block_pool, rtxn->block_idx );
+    zombie_dlist_ele_remove( block->zombie_list, rtxn, disp->pool );
+    /* Fall through to the pool release branch below. */
+  } else {
+    FD_LOG_CRIT(( "completed un-dispatched transaction %lu", txn_idx ));
   }
-  /* For testing purposes, to make sure we don't read a completed
-     transaction, we can clobber the memory. */
-  /* memset( disp->pool+txn_idx, '\xCC', sizeof(fd_rdisp_txn_t) ); */
-  pool_idx_release( disp->pool, txn_idx );
+  if( reclaim ) {
+    /* For testing purposes, to make sure we don't read a completed
+       transaction, we can clobber the memory. */
+    /* memset( disp->pool+txn_idx, '\xCC', sizeof(fd_rdisp_txn_t) ); */
+    rtxn->in_degree = IN_DEGREE_FREE;
+    pool_idx_release( disp->pool, txn_idx );
+  } else {
+    rtxn->in_degree = IN_DEGREE_ZOMBIE;
+    zombie_dlist_ele_push_tail( block->zombie_list, rtxn, disp->pool );
+    rtxn->block_idx = (uint)block_pool_idx( disp->block_pool, block );
+  }
 }
 
 
@@ -1345,12 +1418,65 @@ fd_rdisp_staging_lane_info( fd_rdisp_t           const * disp,
 }
 
 void
-fd_rdisp_verify( fd_rdisp_t const * disp ) {
+fd_rdisp_verify( fd_rdisp_t const * disp,
+                 uint             * scratch ) {
   ulong acct_depth  = disp->depth*MAX_ACCT_PER_TXN;
   ulong block_depth = disp->block_depth;
   FD_TEST( 0==acct_map_verify ( disp->acct_map,      acct_depth+1UL,  disp->acct_pool ) );
   FD_TEST( 0==acct_map_verify ( disp->free_acct_map, acct_depth+1UL,  disp->acct_pool ) );
   FD_TEST( 0==block_map_verify( disp->blockmap,     block_depth+1UL, disp->block_pool ) );
+
+  /* Check all the in degree counts are right */
+  memset( scratch, '\0', sizeof(uint)*(disp->depth+1UL) );
+  scratch[ 0 ] = UINT_MAX;
+  for( ulong j=1UL; j<disp->depth+1UL; j++ ) {
+    fd_rdisp_txn_t const * rtxn = disp->pool+j;
+    if( rtxn->in_degree==IN_DEGREE_FREE ) { scratch[ j ]=UINT_MAX; continue; }
+
+    if( (rtxn->in_degree==IN_DEGREE_UNSTAGED_DISPATCHED) |
+        (rtxn->in_degree==IN_DEGREE_UNSTAGED)            |
+        (rtxn->in_degree==IN_DEGREE_ZOMBIE) ) continue;
+
+    ulong w_cnt = (rtxn->edge_cnt_etc    ) & 0x7FU;
+    ulong r_cnt = (rtxn->edge_cnt_etc>> 7) & 0x7FU;
+    ulong edge_idx = 0UL;
+
+    for( ulong i=0UL; i<w_cnt+r_cnt; i++ ) {
+      edge_t const * e = rtxn->edges+edge_idx;
+      edge_t const  e0 = *e;
+
+      edge_idx += fd_ulong_if( i<w_cnt, 1UL, 3UL );
+
+      if( FD_UNLIKELY( EDGE_IS_LAST( e0 ) ) ) continue;
+
+      edge_t next_e = e0;
+      edge_t const * child_edge;
+      edge_t last_e = 0U;
+      while( 1 ) {
+        int child_is_writer;
+        /* This loop first traverses the me->child link, and then
+           traverses any sibling links.  For example, in the case that
+           we're completing node D above, the first child_txn is E,
+           and the second child_txn is F. */
+        /*            */ child_edge = FOLLOW_EDGE(     disp->pool, next_e, child_is_writer );
+        fd_rdisp_txn_t * child_txn  = FOLLOW_EDGE_TXN( disp->pool, next_e                  );
+        scratch[ child_txn - disp->pool ]++;
+        if( child_is_writer || child_edge[1]==e0 ) break;
+        if( last_e!=0U ) FD_TEST( child_edge[2]==last_e );
+        last_e = next_e;
+        next_e = child_edge[1];
+        FD_TEST( next_e>=0x100U );
+      }
+    }
+  }
+  for( ulong i=1UL; i<disp->depth+1UL; i++ ) {
+    FD_TEST( scratch[ i ]==UINT_MAX ||
+             disp->pool[ i ].in_degree==IN_DEGREE_DISPATCHED ||
+             disp->pool[ i ].in_degree==IN_DEGREE_UNSTAGED ||
+             disp->pool[ i ].in_degree==IN_DEGREE_UNSTAGED_DISPATCHED ||
+             disp->pool[ i ].in_degree==IN_DEGREE_ZOMBIE ||
+             disp->pool[ i ].in_degree==scratch[ i ] );
+  }
 }
 
 void * fd_rdisp_leave ( fd_rdisp_t * disp ) { return disp; }

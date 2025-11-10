@@ -41,7 +41,6 @@ fd_topob_wksp( fd_topo_t *  topo,
   fd_topo_wksp_t * wksp = &topo->workspaces[ topo->wksp_cnt ];
   strncpy( wksp->name, name, sizeof(wksp->name) );
   wksp->id = topo->wksp_cnt;
-  wksp->is_locked = 1;
   topo->wksp_cnt++;
   return wksp;
 }
@@ -348,9 +347,11 @@ fd_topob_auto_layout( fd_topo_t * topo,
     "bencho",
     "genesi", /* FIREDANCER ONLY */
     "ipecho", /* FIREDANCER ONLY */
+    "snapwr", /* FIREDANCER ONLY */
   };
 
   char const * ORDERED[] = {
+    "backt",
     "benchg",
     "benchs",
     "net",
@@ -370,26 +371,29 @@ fd_topob_auto_layout( fd_topo_t * topo,
     "sign",
     "plugin",
     "gui",
+    "rpc",    /* FIREDANCER only */
     "gossvf", /* FIREDANCER only */
     "gossip", /* FIREDANCER only */
     "repair", /* FIREDANCER only */
     "replay", /* FIREDANCER only */
     "exec",   /* FIREDANCER only */
-    "writer", /* FIREDANCER only */
     "send",   /* FIREDANCER only */
     "tower",  /* FIREDANCER only */
     "rpcsrv", /* FIREDANCER only */
     "pktgen",
-    "snaprd", /* FIREDANCER only */
+    "snapct", /* FIREDANCER only */
+    "snapld", /* FIREDANCER only */
     "snapdc", /* FIREDANCER only */
     "snapin", /* FIREDANCER only */
     "arch_f", /* FIREDANCER only */
     "arch_w", /* FIREDANCER only */
+    "vinyl",  /* FIREDANCER only */
   };
 
   char const * CRITICAL_TILES[] = {
     "pack",
     "poh",
+    "snapdc", /* TODO: Snapshot loading speed depends on having full core */
     "snapin", /* TODO: Snapshot loading speed depends on having full core */
   };
 
@@ -655,11 +659,6 @@ fd_topob_finish( fd_topo_t *                topo,
     ulong page_sz = topo->max_page_size;
     if( total_wksp_footprint < topo->gigantic_page_threshold ) page_sz = FD_SHMEM_HUGE_PAGE_SZ;
     if( FD_UNLIKELY( page_sz!=FD_SHMEM_HUGE_PAGE_SZ && page_sz!=FD_SHMEM_GIGANTIC_PAGE_SZ ) ) FD_LOG_ERR(( "invalid page_sz" ));
-
-    /* If the workspace is not locked, we can't use huge pages. */
-    if( FD_UNLIKELY( !wksp->is_locked ) ) {
-      page_sz = FD_SHMEM_NORMAL_PAGE_SZ;
-    }
 
     ulong wksp_aligned_footprint = fd_ulong_align_up( total_wksp_footprint, page_sz );
 

@@ -6,7 +6,7 @@
 #include "proto/block_engine.pb.h"
 #include "proto/bundle.pb.h"
 #include "proto/packet.pb.h"
-#include "../fd_txn_m_t.h"
+#include "../fd_txn_m.h"
 #include "../plugin/fd_plugin.h"
 #include "../../waltz/h2/fd_h2_conn.h"
 #include "../../waltz/http/fd_url.h" /* fd_url_unescape */
@@ -278,7 +278,7 @@ fd_bundle_client_step_reconnect( fd_bundle_tile_t * ctx,
   /* Request block builder info */
   int const builder_info_expired = ( ctx->builder_info_valid_until - now )<0;
   if( FD_UNLIKELY( ( ( !ctx->builder_info_avail ) |
-                     ( !builder_info_expired    ) ) &
+                     ( builder_info_expired     ) ) &
                    ( !ctx->builder_info_wait      ) ) ) {
     fd_bundle_client_request_builder_info( ctx );
     return 1;

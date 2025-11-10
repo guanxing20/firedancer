@@ -7,9 +7,10 @@
 #include "../../features/fd_features.h"
 #include "../fd_txncache.h"
 #include "../fd_bank_hash_cmp.h"
-#include "../../../funk/fd_funk.h"
+#include "../../progcache/fd_progcache_user.h"
 #include "../fd_compute_budget_details.h"
 #include "../../../disco/pack/fd_microblock.h"
+#include "../../../disco/pack/fd_pack.h"
 
 /* Return data for syscalls */
 
@@ -49,19 +50,21 @@ struct fd_exec_txn_ctx {
 
   fd_bank_t * bank;
 
+  fd_exec_stack_t *    exec_stack;
+  fd_exec_accounts_t * exec_accounts;
+
   /* All pointers starting here are valid local joins in txn execution. */
   fd_features_t                        features;
   fd_txncache_t *                      status_cache;
   int                                  enable_exec_recording;
   fd_bank_hash_cmp_t *                 bank_hash_cmp;
-  fd_funk_txn_t *                      funk_txn;
   fd_funk_t                            funk[1];
+  fd_progcache_t *                     progcache;
+  fd_progcache_t                       _progcache[1];
+  fd_funk_txn_xid_t                    xid[1];
   ulong                                slot;
   ulong                                bank_idx;
   fd_txn_p_t                           txn;
-
-  fd_spad_t *                          spad;                                        /* Sized out to handle the worst case footprint of single transaction execution. */
-  fd_wksp_t *                          spad_wksp;                                   /* Workspace for the spad. */
 
   fd_compute_budget_details_t          compute_budget_details;                      /* Compute budget details */
 
@@ -69,6 +72,7 @@ struct fd_exec_txn_ctx {
 
   ulong                                paid_fees;
   ulong                                loaded_accounts_data_size;                   /* The actual transaction loaded data size */
+  ulong                                loaded_accounts_data_size_cost;              /* The cost of the loaded accounts data size in CUs */
   uint                                 custom_err;                                  /* When a custom error is returned, this is where the numeric value gets stashed */
   uchar                                instr_stack_sz;                              /* Current depth of the instruction execution stack. */
   fd_exec_instr_ctx_t                  instr_stack[FD_MAX_INSTRUCTION_STACK_DEPTH]; /* Instruction execution stack. */
@@ -115,9 +119,6 @@ struct fd_exec_txn_ctx {
   fd_hash_t                       blake_txn_msg_hash;                          /* Hash of raw transaction message used by the status cache */
   ulong                           execution_fee;                               /* Execution fee paid by the fee payer in the transaction */
   ulong                           priority_fee;                                /* Priority fee paid by the fee payer in the transaction */
-  ulong                           collected_rent;                              /* Rent collected from accounts in this transaction */
-
-  uchar dirty_vote_acc : 1; /* 1 if this transaction maybe modified a vote account */
 
   fd_capture_ctx_t * capture_ctx;
 
@@ -153,10 +154,22 @@ struct fd_exec_txn_ctx {
    /* The current instruction index being executed */
   int current_instr_idx;
 
-  /* fuzzing options */
   struct {
-    int enable_vm_tracing;
-  } fuzz_config;
+    int                 is_bundle;
+    fd_exec_txn_ctx_t * prev_txn_ctxs[ FD_PACK_MAX_TXN_PER_BUNDLE ];
+    ulong               prev_txn_ctxs_cnt;
+  } bundle;
+
+  /* debugging options */
+
+  /* Pointer to buffer used for dumping instructions and transactions
+     into protobuf files. */
+  uchar * dumping_mem;
+
+  /* Pointer to buffer used for tracing instructions and transactions
+     into protobuf files. */
+  int enable_vm_tracing;
+  uchar * tracing_mem;
 };
 
 #define FD_EXEC_TXN_CTX_ALIGN     (alignof(fd_exec_txn_ctx_t))
@@ -199,7 +212,7 @@ void *
 fd_exec_txn_ctx_new( void * mem );
 
 fd_exec_txn_ctx_t *
-fd_exec_txn_ctx_join( void * mem, fd_spad_t * spad, fd_wksp_t * spad_wksp );
+fd_exec_txn_ctx_join( void * mem );
 
 void *
 fd_exec_txn_ctx_leave( fd_exec_txn_ctx_t * ctx );

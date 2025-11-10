@@ -2,7 +2,7 @@ ifdef FD_HAS_INT128
 $(call add-hdrs,fd_acc_mgr.h)
 $(call add-objs,fd_acc_mgr,fd_flamenco)
 
-$(call add-hdrs,fd_bank_hash_cmp.h fd_rwseq_lock.h)
+$(call add-hdrs,fd_bank_hash_cmp.h)
 $(call add-objs,fd_bank_hash_cmp,fd_flamenco)
 
 $(call add-hdrs,fd_blockhashes.h)
@@ -20,8 +20,8 @@ $(call make-unit-test,test_hashes,test_hashes,fd_flamenco fd_funk fd_ballet fd_u
 $(call add-hdrs,fd_pubkey_utils.h)
 $(call add-objs,fd_pubkey_utils,fd_flamenco)
 
-$(call add-hdrs,fd_txncache.h)
-$(call add-objs,fd_txncache,fd_flamenco)
+$(call add-hdrs,fd_txncache_shmem.h fd_txncache.h)
+$(call add-objs,fd_txncache_shmem fd_txncache,fd_flamenco)
 
 $(call add-hdrs,fd_cost_tracker.h)
 $(call add-objs,fd_cost_tracker,fd_flamenco)
@@ -41,6 +41,9 @@ $(call add-hdrs,fd_txn_account.h)
 $(call add-objs,fd_txn_account,fd_flamenco)
 $(call make-unit-test,test_txn_account,test_txn_account,fd_flamenco fd_funk fd_ballet fd_util)
 $(call run-unit-test,test_txn_account,)
+ifdef FD_HAS_SECP256K1
+$(call make-unit-test,test_runtime_alut,test_runtime_alut,fd_flamenco fd_funk fd_ballet fd_util)
+endif
 
 $(call add-hdrs,fd_bank.h)
 $(call add-objs,fd_bank,fd_flamenco)
@@ -49,14 +52,9 @@ $(call run-unit-test,test_bank,)
 
 $(call make-unit-test,test_txncache,test_txncache,fd_flamenco fd_ballet fd_util)
 
-ifdef FD_HAS_SECP256K1
-$(call make-unit-test,test_txn_rw_conflicts,test_txn_rw_conflicts,fd_flamenco fd_funk fd_ballet fd_util, $(SECP256K1_LIBS))
-$(call run-unit-test,test_txn_rw_conflicts)
-endif
-
 ifdef FD_HAS_ATOMIC
-$(call add-hdrs,fd_runtime.h fd_runtime_init.h fd_runtime_err.h fd_runtime_const.h)
-$(call add-objs,fd_runtime fd_runtime_init ,fd_flamenco)
+$(call add-hdrs,fd_runtime.h fd_runtime_init.h fd_runtime_err.h fd_runtime_const.h fd_runtime_stack.h fd_exec_stack.h)
+$(call add-objs,fd_runtime fd_runtime_init,fd_flamenco)
 endif
 
 endif

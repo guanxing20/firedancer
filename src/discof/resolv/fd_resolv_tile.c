@@ -1,12 +1,12 @@
 #include "fd_resolv_tile.h"
-#include "../../disco/fd_txn_m_t.h"
+#include "../../disco/fd_txn_m.h"
 #include "../../disco/topo/fd_topo.h"
-#include "../bank/fd_bank_err.h"
 #include "../replay/fd_replay_tile.h"
 #include "generated/fd_resolv_tile_seccomp.h"
 #include "../../disco/metrics/fd_metrics.h"
+#include "../../flamenco/accdb/fd_accdb_sync.h"
+#include "../../flamenco/runtime/fd_alut_interp.h"
 #include "../../flamenco/runtime/fd_system_ids_pp.h"
-#include "../../flamenco/runtime/fd_runtime.h"
 #include "../../flamenco/runtime/fd_bank.h"
 #include "../../util/pod/fd_pod_format.h"
 
@@ -147,7 +147,8 @@ typedef struct {
      rooted bank (after exchanging it for a new rooted bank). */
   fd_banks_t * banks;
   fd_bank_t *  bank;
-  fd_funk_t    funk[1];
+
+  fd_accdb_user_t accdb[1];
 
   fd_stashed_txn_m_t * pool;
   map_chain_t *        map_chain;
@@ -165,6 +166,7 @@ typedef struct {
     ulong blockhash_expired;
     ulong bundle_peer_failure;
     ulong stash[ FD_METRICS_COUNTER_RESOLV_STASH_OPERATION_CNT ];
+    ulong db_race;
   } metrics;
 
   fd_resolv_in_ctx_t in[ 64UL ];
@@ -195,6 +197,7 @@ metrics_write( fd_resolv_ctx_t * ctx ) {
   FD_MCNT_ENUM_COPY( RESOLF, LUT_RESOLVED,                    ctx->metrics.lut );
   FD_MCNT_ENUM_COPY( RESOLF, STASH_OPERATION,                 ctx->metrics.stash );
   FD_MCNT_SET(       RESOLF, TRANSACTION_BUNDLE_PEER_FAILURE, ctx->metrics.bundle_peer_failure );
+  FD_MCNT_SET(       RESOLF, DB_RACES,                        ctx->metrics.db_race );
 }
 
 static int
@@ -233,9 +236,6 @@ during_frag( fd_resolv_ctx_t * ctx,
         ctx->_rooted_slot_msg = *(fd_replay_root_advanced_t *)fd_chunk_to_laddr_const( ctx->in[in_idx].mem, chunk );
       } else if( FD_UNLIKELY( sig==REPLAY_SIG_SLOT_COMPLETED ) ) {
         ctx->_completed_slot_msg = *(fd_replay_slot_completed_t *)fd_chunk_to_laddr_const( ctx->in[in_idx].mem, chunk );
-      } else if( FD_UNLIKELY( sig==REPLAY_SIG_VOTE_STATE ) ) {
-      } else {
-        FD_LOG_ERR(( "invariant violation: unknown sig %lu", sig ));
       }
       break;
     }
@@ -244,7 +244,99 @@ during_frag( fd_resolv_ctx_t * ctx,
   }
 }
 
-static inline int
+/* peek_alut reads a single address lookup table from database cache. */
+
+static int
+peek_alut( fd_resolv_ctx_t *  ctx,
+           fd_txn_m_t *       txnm,
+           fd_alut_interp_t * interp,
+           ulong              alut_idx ) {
+  fd_funk_txn_xid_t const xid = { .ul = { fd_bank_slot_get( ctx->bank ), fd_bank_slot_get( ctx->bank ) } };
+
+  ulong ro_indir_cnt_old = interp->ro_indir_cnt;
+  ulong rw_indir_cnt_old = interp->rw_indir_cnt;
+  ulong alut_idx_old     = interp->alut_idx;
+
+  fd_txn_t const * txn         = fd_txn_m_txn_t_const  ( txnm );
+  uchar const *    txn_payload = fd_txn_m_payload_const( txnm );
+  fd_txn_acct_addr_lut_t const * addr_lut =
+      &fd_txn_get_address_tables_const( txn )[ alut_idx ];
+  fd_pubkey_t addr_lut_acc = FD_LOAD( fd_pubkey_t, txn_payload+addr_lut->addr_off );
+
+  int err = 0;
+  for(;;) {
+    fd_accdb_peek_t _peek[1];
+    fd_accdb_peek_t * peek = fd_accdb_peek(
+        ctx->accdb, _peek, &xid, &addr_lut_acc );
+    if( FD_UNLIKELY( !peek ) ) {
+      err = FD_RUNTIME_TXN_ERR_ADDRESS_LOOKUP_TABLE_NOT_FOUND;
+      break;
+    }
+
+    err = fd_alut_interp_next(
+        interp,
+        &addr_lut_acc,
+        fd_accdb_ref_owner     ( peek->acc ),
+        fd_accdb_ref_data_const( peek->acc ),
+        fd_accdb_ref_data_sz   ( peek->acc ) );
+
+    int peek_ok = fd_accdb_peek_test( peek );
+    fd_accdb_peek_drop( peek );
+    if( FD_LIKELY( peek_ok ) ) break;
+
+    /* Restore old interp state and retry */
+    FD_SPIN_PAUSE();
+    ctx->metrics.db_race++;
+    interp->ro_indir_cnt = ro_indir_cnt_old;
+    interp->rw_indir_cnt = rw_indir_cnt_old;
+    interp->alut_idx     = alut_idx_old;
+  }
+
+  return err;
+}
+
+/* peek_aluts reads address lookup tables from database cache.
+   Gracefully recovers from data races and missing accounts. */
+
+static int
+peek_aluts( fd_resolv_ctx_t * ctx,
+            fd_txn_m_t *      txnm ) {
+
+  /* Unpack context */
+  fd_txn_t const *          txn          = fd_txn_m_txn_t_const  ( txnm );
+  uchar const *             txn_payload  = fd_txn_m_payload_const( txnm );
+  ulong const               alut_cnt     = txn->addr_table_lookup_cnt;
+  ulong const               slot         = fd_bank_slot_get( ctx->bank );
+  fd_sysvar_cache_t const * sysvar_cache = fd_bank_sysvar_cache_query( ctx->bank ); FD_TEST( sysvar_cache );
+  fd_slot_hash_t const *    slot_hashes  = fd_sysvar_cache_slot_hashes_join_const( sysvar_cache );
+
+  /* Write indirect addrs into here */
+  fd_acct_addr_t * indir_addrs = fd_txn_m_alut( txnm );
+
+  int err = FD_RUNTIME_EXECUTE_SUCCESS;
+  fd_alut_interp_t interp[1];
+  fd_alut_interp_new( interp, indir_addrs, txn, txn_payload, slot_hashes, slot );
+  for( ulong i=0UL; i<alut_cnt; i++ ) {
+    err = peek_alut( ctx, txnm, interp, i );
+    if( FD_UNLIKELY( err ) ) break;
+  }
+  fd_alut_interp_delete( interp );
+  fd_sysvar_cache_slot_hashes_leave_const( sysvar_cache, slot_hashes );
+
+  ulong ctr_idx;
+  switch( err ) {
+  case FD_RUNTIME_EXECUTE_SUCCESS:                            ctr_idx = FD_METRICS_ENUM_LUT_RESOLVE_RESULT_V_SUCCESS_IDX;               break;
+  case FD_RUNTIME_TXN_ERR_ADDRESS_LOOKUP_TABLE_NOT_FOUND:     ctr_idx = FD_METRICS_ENUM_LUT_RESOLVE_RESULT_V_ACCOUNT_NOT_FOUND_IDX;     break;
+  case FD_RUNTIME_TXN_ERR_INVALID_ADDRESS_LOOKUP_TABLE_OWNER: ctr_idx = FD_METRICS_ENUM_LUT_RESOLVE_RESULT_V_INVALID_ACCOUNT_OWNER_IDX; break;
+  case FD_RUNTIME_TXN_ERR_INVALID_ADDRESS_LOOKUP_TABLE_DATA:  ctr_idx = FD_METRICS_ENUM_LUT_RESOLVE_RESULT_V_INVALID_ACCOUNT_DATA_IDX;  break;
+  case FD_RUNTIME_TXN_ERR_INVALID_ADDRESS_LOOKUP_TABLE_INDEX: ctr_idx = FD_METRICS_ENUM_LUT_RESOLVE_RESULT_V_INVALID_LOOKUP_INDEX_IDX;  break;
+  default:                                                    ctr_idx = FD_METRICS_ENUM_LUT_RESOLVE_RESULT_V_ACCOUNT_UNINITIALIZED_IDX; break;
+  }
+  ctx->metrics.lut[ ctr_idx ]++;
+  return err;
+}
+
+static int
 publish_txn( fd_resolv_ctx_t *          ctx,
              fd_stem_context_t *        stem,
              fd_stashed_txn_m_t const * stashed ) {
@@ -256,26 +348,12 @@ publish_txn( fd_resolv_ctx_t *          ctx,
   txnm->reference_slot = ctx->flushing_slot;
 
   if( FD_UNLIKELY( txnt->addr_table_adtl_cnt ) ) {
-    fd_sysvar_cache_t const * sysvar_cache = fd_bank_sysvar_cache_query( ctx->bank );
-    FD_TEST( sysvar_cache );
-
-    /* TODO: We really should use a specific transaction for the root
-       slot, not "NULL" which has TOCTOU issues with replay swapping
-       the funk root in the background.  If we took any reference to
-       the root slot number (e.g. ALUT cannot be closed before slot
-       "root" + 512 due to not currently closed), this could end up
-       being wrong. */
-    fd_slot_hash_t const * slot_hashes = fd_sysvar_cache_slot_hashes_join_const( sysvar_cache );
-    int result = fd_runtime_load_txn_address_lookup_tables( txnt,
-                                                            fd_txn_m_payload( txnm ),
-                                                            ctx->funk,
-                                                            NULL, /* NULL is the root Funk transaction */
-                                                            fd_bank_slot_get( ctx->bank ),
-                                                            slot_hashes,
-                                                            fd_txn_m_alut( txnm) );
-    fd_sysvar_cache_slot_hashes_leave_const( sysvar_cache, slot_hashes );
-    ctx->metrics.lut[ result ]++;
-    if( FD_UNLIKELY( result ) ) return 0;
+    if( FD_UNLIKELY( !ctx->bank ) ) {
+      FD_MCNT_INC( RESOLF, NO_BANK_DROP, 1 );
+      return 0;
+    }
+    int err = peek_aluts( ctx, txnm );
+    if( FD_UNLIKELY( err ) ) return 0;
   }
 
   ulong realized_sz = fd_txn_m_realized_footprint( txnm, 1, 1 );
@@ -370,26 +448,25 @@ after_frag( fd_resolv_ctx_t *   ctx,
         fd_replay_root_advanced_t const * msg = &ctx->_rooted_slot_msg;
 
         /* Replace current bank with new bank */
-        ulong prev_bank_idx = fd_banks_get_pool_idx( ctx->banks, ctx->bank );
-        ctx->bank = fd_banks_get_bank_idx( ctx->banks, msg->bank_idx );
+        fd_bank_t * prev_bank = ctx->bank;
+
+        ctx->bank = fd_banks_bank_query( ctx->banks, msg->bank_idx );
         FD_TEST( ctx->bank );
 
-        /* Send slot completed message back to replay, so it can decrement
-           the refcount of the previous bank. */
-        if( FD_UNLIKELY( prev_bank_idx!=fd_banks_pool_idx_null( fd_banks_get_bank_pool( ctx->banks ) ) ) ) {
+        /* Send slot completed message back to replay, so it can
+           decrement the reference count of the previous bank. */
+        if( FD_LIKELY( prev_bank ) ) {
           ulong tspub = fd_frag_meta_ts_comp( fd_tickcount() );
           fd_resolv_slot_exchanged_t * slot_exchanged =
             fd_type_pun( fd_chunk_to_laddr( ctx->out_replay->mem, ctx->out_replay->chunk ) );
-          slot_exchanged->bank_idx = prev_bank_idx;
+          slot_exchanged->bank_idx = prev_bank->idx;
           fd_stem_publish( stem, 1UL, 0UL, ctx->out_replay->chunk, sizeof(fd_resolv_slot_exchanged_t), 0UL, tsorig, tspub );
           ctx->out_replay->chunk = fd_dcache_compact_next( ctx->out_replay->chunk, sizeof(fd_resolv_slot_exchanged_t), ctx->out_replay->chunk0, ctx->out_replay->wmark );
         }
 
         break;
       }
-      case REPLAY_SIG_VOTE_STATE: break;
-      default:
-        FD_LOG_ERR(( "unknown sig %lu", sig ));
+      default: break;
     }
     return;
   }
@@ -477,22 +554,13 @@ after_frag( fd_resolv_ctx_t *   ctx,
   }
 
   if( FD_UNLIKELY( txnt->addr_table_adtl_cnt ) ) {
-    fd_sysvar_cache_t const * sysvar_cache = fd_bank_sysvar_cache_query( ctx->bank );
-    FD_TEST( sysvar_cache );
-    fd_slot_hash_t const * slot_hashes = fd_sysvar_cache_slot_hashes_join_const( sysvar_cache );
-    FD_TEST( slot_hashes );
+    if( FD_UNLIKELY( !ctx->bank ) ) {
+      FD_MCNT_INC( RESOLF, NO_BANK_DROP, 1 );
+      if( FD_UNLIKELY( txnm->block_engine.bundle_id ) ) ctx->bundle_failed = 1;
+      return;
+    }
 
-    /* TODO: As above, should probably try and use a funk transaction
-       referencing the specific root slot. */
-    int result = fd_runtime_load_txn_address_lookup_tables( txnt,
-                                                            fd_txn_m_payload( txnm ),
-                                                            ctx->funk,
-                                                            NULL, /* NULL is the root Funk transaction */
-                                                            fd_bank_slot_get( ctx->bank ),
-                                                            slot_hashes,
-                                                            fd_txn_m_alut( txnm) );
-    fd_sysvar_cache_slot_hashes_leave_const( sysvar_cache, slot_hashes );
-    ctx->metrics.lut[ -fd_bank_lut_err_from_runtime_err( result ) ]++;
+    int result = peek_aluts( ctx, txnm );
     if( FD_UNLIKELY( result ) ) {
       if( FD_UNLIKELY( txnm->block_engine.bundle_id ) ) ctx->bundle_failed = 1;
       return;
@@ -563,7 +631,7 @@ unprivileged_init( fd_topo_t *      topo,
   ctx->out_replay->wmark  = fd_dcache_compact_wmark ( ctx->out_replay->mem, topo->links[ tile->out_link_id[ 1 ] ].dcache, topo->links[ tile->out_link_id[ 1 ] ].mtu );
   ctx->out_replay->chunk  = ctx->out_replay->chunk0;
 
-  FD_TEST( fd_funk_join( ctx->funk, fd_topo_obj_laddr( topo, tile->resolv.funk_obj_id ) ) );
+  FD_TEST( fd_accdb_user_join( ctx->accdb, fd_topo_obj_laddr( topo, tile->resolv.funk_obj_id ) ) );
 
   ulong banks_obj_id = fd_pod_queryf_ulong( topo->props, ULONG_MAX, "banks" );
   FD_TEST( banks_obj_id!=ULONG_MAX );

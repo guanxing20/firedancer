@@ -27,9 +27,7 @@ fd_exec_txn_ctx_new( void * mem ) {
 }
 
 fd_exec_txn_ctx_t *
-fd_exec_txn_ctx_join( void *      mem,
-                      fd_spad_t * spad,
-                      fd_wksp_t * spad_wksp ) {
+fd_exec_txn_ctx_join( void * mem ) {
   if( FD_UNLIKELY( !mem ) ) {
     FD_LOG_WARNING(( "NULL block" ));
     return NULL;
@@ -41,10 +39,6 @@ fd_exec_txn_ctx_join( void *      mem,
     FD_LOG_WARNING(( "bad magic" ));
     return NULL;
   }
-
-  /* Rejoin the wksp */
-  ctx->spad      = spad;
-  ctx->spad_wksp = spad_wksp;
 
   return ctx;
 }
@@ -183,19 +177,18 @@ fd_exec_txn_ctx_setup_basic( fd_exec_txn_ctx_t * ctx ) {
   ctx->executable_cnt            = 0UL;
   ctx->programs_to_reverify_cnt  = 0UL;
 
-  ctx->paid_fees                 = 0UL;
-  ctx->loaded_accounts_data_size = 0UL;
-  ctx->accounts_resize_delta     = 0UL;
-  ctx->collected_rent            = 0UL;
+  ctx->paid_fees                      = 0UL;
+  ctx->loaded_accounts_data_size      = 0UL;
+  ctx->loaded_accounts_data_size_cost = 0UL;
+  ctx->accounts_resize_delta          = 0UL;
 
   ctx->num_instructions = 0;
   memset( ctx->return_data.program_id.key, 0, sizeof(fd_pubkey_t) );
   ctx->return_data.len = 0;
 
-  ctx->dirty_vote_acc  = 0;
-  ctx->failed_instr    = NULL;
-  ctx->instr_err_idx   = INT_MAX;
-  ctx->capture_ctx     = NULL;
+  ctx->failed_instr  = NULL;
+  ctx->instr_err_idx = INT_MAX;
+  ctx->capture_ctx   = NULL;
 
   ctx->instr_info_cnt     = 0UL;
   ctx->cpi_instr_info_cnt = 0UL;

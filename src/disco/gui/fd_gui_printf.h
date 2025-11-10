@@ -15,10 +15,14 @@ void fd_gui_printf_vote_key( fd_gui_t * gui );
 void fd_gui_printf_startup_time_nanos( fd_gui_t * gui );
 void fd_gui_printf_vote_state( fd_gui_t * gui );
 void fd_gui_printf_vote_distance( fd_gui_t * gui );
+void fd_gui_printf_turbine_slot( fd_gui_t * gui );
+void fd_gui_printf_repair_slot( fd_gui_t * gui );
+void fd_gui_printf_slot_caught_up( fd_gui_t * gui );
 void fd_gui_printf_skipped_history( fd_gui_t * gui );
 void fd_gui_printf_skipped_history_cluster( fd_gui_t * gui );
 void fd_gui_printf_tps_history( fd_gui_t * gui );
 void fd_gui_printf_startup_progress( fd_gui_t * gui );
+void fd_gui_printf_boot_progress( fd_gui_t * gui );
 void fd_gui_printf_block_engine( fd_gui_t * gui );
 void fd_gui_printf_tiles( fd_gui_t * gui );
 void fd_gui_printf_schedule_strategy( fd_gui_t * gui );
@@ -30,6 +34,8 @@ void fd_gui_printf_optimistically_confirmed_slot( fd_gui_t * gui );
 void fd_gui_printf_completed_slot( fd_gui_t * gui );
 void fd_gui_printf_estimated_slot( fd_gui_t * gui );
 void fd_gui_printf_estimated_tps( fd_gui_t * gui );
+void fd_gui_printf_shred_updates( fd_gui_t * gui );
+void fd_gui_printf_catch_up_history( fd_gui_t * gui );
 
 void
 fd_gui_printf_null_query_response( fd_http_server_t * http,
@@ -44,6 +50,15 @@ fd_gui_printf_skip_rate( fd_gui_t * gui,
 void
 fd_gui_printf_epoch( fd_gui_t * gui,
                      ulong      epoch_idx );
+
+void
+fd_gui_peers_printf_nodes( fd_gui_peers_ctx_t * peers,
+                           int *                actions,
+                           ulong *              idxs,
+                           ulong                count );
+
+void
+fd_gui_peers_printf_node_all( fd_gui_peers_ctx_t * peers );
 
 void
 fd_gui_printf_peers_gossip_update( fd_gui_t *          gui,
@@ -105,6 +120,11 @@ fd_gui_printf_slot_transactions_request( fd_gui_t * gui,
                                          ulong      id );
 
 void
+fd_gui_printf_slot_shred_updates( fd_gui_t * gui,
+                                  ulong      _slot,
+                                  ulong      id );
+
+void
 fd_gui_printf_live_tile_timers( fd_gui_t * gui );
 
 void
@@ -117,5 +137,21 @@ void
 fd_gui_printf_live_tile_stats( fd_gui_t *                  gui,
                                fd_gui_tile_stats_t const * prev,
                                fd_gui_tile_stats_t const * cur );
+
+void
+fd_gui_printf_peers_viewport_update( fd_gui_peers_ctx_t *  peers,
+                                     ulong                 ws_conn_id );
+
+void
+fd_gui_printf_peers_viewport_request( fd_gui_peers_ctx_t *  peers,
+                                      char const *          key,
+                                      ulong                 ws_conn_id,
+                                      ulong                 request_id );
+
+void
+fd_gui_printf_peers_view_resize( fd_gui_peers_ctx_t *  peers, ulong sz );
+
+void
+fd_gui_peers_printf_gossip_stats( fd_gui_peers_ctx_t *  peers );
 
 #endif /* HEADER_fd_src_disco_gui_fd_gui_printf_h */

@@ -1,5 +1,5 @@
-#ifndef HEADER_fd_src_app_fdctl_run_tiles_h
-#define HEADER_fd_src_app_fdctl_run_tiles_h
+#ifndef HEADER_fd_src_disco_tiles_h
+#define HEADER_fd_src_disco_tiles_h
 
 #include "stem/fd_stem.h"
 #include "shred/fd_shredder.h"
@@ -8,7 +8,7 @@
 #include "pack/fd_pack.h"
 #include "topo/fd_topo.h"
 #include "bundle/fd_bundle_crank.h"
-#include "fd_txn_m_t.h"
+#include "../disco/metrics/generated/fd_metrics_pack.h"
 
 #include <linux/filter.h>
 
@@ -150,7 +150,16 @@ struct fd_microblock_trailer {
 typedef struct fd_microblock_trailer fd_microblock_trailer_t;
 
 struct fd_done_packing {
-   ulong microblocks_in_slot;
+  ulong microblocks_in_slot;
+
+  fd_pack_limits_usage_t limits_usage[ 1 ];
+  fd_pack_limits_t limits[ 1 ];
+
+  ulong block_results    [ FD_METRICS_COUNTER_PACK_TRANSACTION_SCHEDULE_CNT ];
+  ulong end_block_results[ FD_METRICS_COUNTER_PACK_TRANSACTION_SCHEDULE_CNT ];
+
+  fd_pack_smallest_t pending_smallest[ 1 ];
+  fd_pack_smallest_t pending_votes_smallest[ 1 ];
 };
 typedef struct fd_done_packing fd_done_packing_t;
 
@@ -194,4 +203,4 @@ typedef struct __attribute__((packed)) {
   uchar  last_entry_hash[32];
 } fd_poh_init_msg_t;
 
-#endif /* HEADER_fd_src_app_fdctl_run_tiles_h */
+#endif /* HEADER_fd_src_disco_tiles_h */

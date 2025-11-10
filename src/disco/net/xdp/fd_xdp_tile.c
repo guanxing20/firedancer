@@ -376,7 +376,7 @@ net_load_netdev_tbl( fd_net_ctx_t * ctx ) {
   if( FD_UNLIKELY( !fd_dbl_buf_read( ctx->netdev_dbl_buf, ctx->netdev_buf_sz, ctx->netdev_buf, NULL ) ) ) return;
 
   /* Join local copy */
-  if( FD_UNLIKELY( !fd_netdev_tbl_join( &ctx->netdev_dbl_buf, ctx->netdev_buf ) ) ) FD_LOG_ERR(("netdev table join failed"));
+  if( FD_UNLIKELY( !fd_netdev_tbl_join( &ctx->netdev_tbl, ctx->netdev_buf ) ) ) FD_LOG_ERR(("netdev table join failed"));
 }
 
 /* Query the netdev table. Return a fd_netdev_t pointer to the net device of the
@@ -645,6 +645,12 @@ before_frag( fd_net_ctx_t * ctx,
   uint target_idx   = hash % net_tile_cnt;
   uint net_tile_id  = ctx->net_tile_id;
   uint dst_ip       = fd_disco_netmux_sig_ip( sig );
+
+  /* Skip if another net tile is responsible for this packet.
+     Fast path for net tiles other than net_tile 0. */
+
+  if( net_tile_id!=0 && net_tile_id!=target_idx ) return 1; /* ignore */
+
 
   ctx->tx_op.use_gre          = 0;
   ctx->tx_op.gre_outer_dst_ip = 0;

@@ -1,5 +1,5 @@
-#ifndef HEADER_fd_src_flamenco_runtime_tests_harness_fd_solfuzz_private_h
-#define HEADER_fd_src_flamenco_runtime_tests_harness_fd_solfuzz_private_h
+#ifndef HEADER_fd_src_flamenco_runtime_tests_fd_solfuzz_private_h
+#define HEADER_fd_src_flamenco_runtime_tests_fd_solfuzz_private_h
 
 /* fd_solfuzz_private.h contains internal components for the solfuzz
    Protobuf shim. */
@@ -13,26 +13,20 @@
 FD_PROTOTYPES_BEGIN
 
 /* Creates / overwrites an account in funk given an input account state.
-   On success, loads the account into `acc`. Optionally, reject any zero-lamport
-   accounts from being loaded in. */
+   On success, loads the account into acc.  Optionally, reject any
+   zero-lamport accounts from being loaded in. */
 int
-fd_runtime_fuzz_load_account( fd_txn_account_t *                acc,
-                              fd_funk_t *                       funk,
-                              fd_funk_txn_t *                   funk_txn,
-                              fd_exec_test_acct_state_t const * state,
-                              uchar                             reject_zero_lamports );
+fd_solfuzz_pb_load_account( fd_txn_account_t *                acc,
+                            fd_accdb_user_t *                 accdb,
+                            fd_funk_txn_xid_t const *         xid,
+                            fd_exec_test_acct_state_t const * state,
+                            uchar                             reject_zero_lamports );
 
-/* Activates features in the runtime given an input feature set. Fails if a passed-in feature
-   is unknown / not supported. */
+/* Activates features in the runtime given an input feature set.  Fails
+   if a passed-in feature is unknown / not supported. */
 int
-fd_runtime_fuzz_restore_features( fd_features_t *                    features,
-                                  fd_exec_test_feature_set_t const * feature_set );
-
-void
-fd_runtime_fuzz_refresh_program_cache( fd_exec_slot_ctx_t *              slot_ctx,
-                                       fd_exec_test_acct_state_t const * acct_states,
-                                       ulong                             acct_states_count,
-                                       fd_spad_t *                       runtime_spad );
+fd_solfuzz_pb_restore_features( fd_features_t *                    features,
+                                fd_exec_test_feature_set_t const * feature_set );
 
 typedef ulong( exec_test_run_fn_t )( fd_solfuzz_runner_t *,
                                      void const *,
@@ -41,10 +35,10 @@ typedef ulong( exec_test_run_fn_t )( fd_solfuzz_runner_t *,
                                      ulong );
 
 static inline void
-fd_solfuzz_execute_wrapper( fd_solfuzz_runner_t * runner,
-                            void * input,
-                            void ** output,
-                            exec_test_run_fn_t * exec_test_run_fn ) {
+fd_solfuzz_pb_execute_wrapper( fd_solfuzz_runner_t * runner,
+                               void *                input,
+                               void **               output,
+                               exec_test_run_fn_t *  exec_test_run_fn ) {
 
   ulong out_bufsz = 100000000;  /* 100 MB */
   void * out0 = fd_spad_alloc( runner->spad, 1UL, out_bufsz );
@@ -112,4 +106,4 @@ sol_compat_encode( uchar *              out,
 
 FD_PROTOTYPES_END
 
-#endif /* HEADER_fd_src_flamenco_runtime_tests_harness_fd_solfuzz_private_h */
+#endif /* HEADER_fd_src_flamenco_runtime_tests_fd_solfuzz_private_h */

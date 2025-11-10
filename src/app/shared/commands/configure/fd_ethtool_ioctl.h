@@ -40,7 +40,11 @@
 
 #define FD_ETHTOOL_MAX_RXFH_TABLE_CNT (32768)
 
-#define FD_ETHTOOL_FEATURE_NTUPLE "rx-ntuple-filter"
+#define FD_ETHTOOL_FEATURE_NTUPLE        "rx-ntuple-filter"
+#define FD_ETHTOOL_FEATURE_TXUDPSEG      "tx-udp-segmentation"
+#define FD_ETHTOOL_FEATURE_TXGRESEG      "tx-gre-segmentation"
+#define FD_ETHTOOL_FEATURE_TXGRECSUMSEG  "tx-gre-csum-segmentation"
+#define FD_ETHTOOL_FEATURE_RXUDPGROFWD   "rx-udp-gro-forwarding"
 
 struct fd_ethtool_ioctl {
   int          fd;
@@ -99,12 +103,22 @@ fd_ethtool_ioctl_rxfh_set_default( fd_ethtool_ioctl_t * ioc );
    a prefix of queues.  The typical use case is to prevent general
    packets from landing on these queues so ntuple rules can steer
    special packets to them instead.  start_idx is inclusive, so the
-   table will be distributed across [start_idx, num_channels).
+   table will be distributed across [start_idx, queue_cnt).
    Returns nonzero on failure. */
 
 int
 fd_ethtool_ioctl_rxfh_set_suffix( fd_ethtool_ioctl_t * ioc,
                                   uint                 start_idx );
+
+/* fd_ethtool_ioctl_rxfh_get_queue_cnt gets the maximum number of queues
+   that the RXFH table can indirect to.  Usually, this is equal to the
+   current number of active channels.  However, some devices have further
+   restrictions and not all queues can be used.  Returns nonzero on
+   failure. */
+
+int
+fd_ethtool_ioctl_rxfh_get_queue_cnt( fd_ethtool_ioctl_t * ioc,
+                                     uint *               queue_cnt );
 
 /* fd_ethtool_ioctl_rxfh_get_table writes the current state of the
    RXFH table into the user-supplied table array, which must have space
@@ -132,6 +146,22 @@ int
 fd_ethtool_ioctl_feature_test( fd_ethtool_ioctl_t * ioc,
                                char const *         name,
                                int *                enabled );
+
+/* fd_ethtool_ioctl_feature_gro_set enables or disables the
+   generic-receive-offload feature.  Returns nonzero on failure. */
+
+int
+fd_ethtool_ioctl_feature_gro_set( fd_ethtool_ioctl_t * ioc,
+                                  int                  enabled );
+
+/* fd_ethtool_ioctl_feature_gro_test sets enabled to 1 if the
+   generic-receive-offload feature is enabled.  Sets supported to 1
+   if this feature is supported.  Returns nonzero on failure. */
+
+int
+fd_ethtool_ioctl_feature_gro_test( fd_ethtool_ioctl_t * ioc,
+                                   int *                enabled,
+                                   int *                supported );
 
 /* fd_ethtool_ioctl_ntuple_clear deletes any active ntuple flow steering
    rules, which is the default state.  Returns nonzero on failure. */

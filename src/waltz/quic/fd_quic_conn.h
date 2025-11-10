@@ -8,6 +8,7 @@
 #include "fd_quic_conn_id.h"
 #include "crypto/fd_quic_crypto_suites.h"
 #include "fd_quic_pkt_meta.h"
+#include "fd_quic_svc_q.h"
 #include "../fd_rtt_est.h"
 
 #define FD_QUIC_CONN_STATE_INVALID            0 /* dead object / freed */
@@ -93,14 +94,11 @@ struct fd_quic_conn {
   uint               key_phase : 1;
   uint               key_update : 1;
 
-  /* Service queue dlist membership.  All active conns (state not INVALID)
-     are in a service queue, FD_QUIC_SVC_TYPE_WAIT by default.
-     Free conns (svc_type==UINT_MAX) are members of a singly linked list
-     (only svc_next set) */
-  uint               svc_type;  /* FD_QUIC_SVC_{...} or UINT_MAX */
-  uint               svc_prev;
-  uint               svc_next;
-  long               svc_time;  /* service may be delayed until this timestamp */
+  /* metadata used by service queue */
+  fd_quic_svc_timers_conn_meta_t svc_meta;
+
+  /* Dlist membership  */
+  uint               free_conn_next;
 
   ulong              our_conn_id;
 
@@ -168,6 +166,7 @@ struct fd_quic_conn {
                                  INITIAL, HANDSHAKE and APPLICATION */
   ulong pkt_number[3];      /* tx packet number by pn space */
   ulong last_pkt_number[3]; /* last (highest) packet number seen */
+  ulong highest_acked[3];   /* highest packet number acked (meaningless if 0) */
 
   ushort ipv4_id;           /* ipv4 id field */
 
@@ -210,9 +209,6 @@ struct fd_quic_conn {
      if we time out this packet (or possibly a later packet) we resend the frame
        and update this value */
   ulong                upd_pkt_number;
-
-  /* highest peer encryption level */
-  uchar                peer_enc_level;
 
   /* idle timeout arguments */
   long                 idle_timeout_ns;
@@ -291,6 +287,11 @@ fd_quic_conn_set_context( fd_quic_conn_t * conn, void * context );
 /* get the user-defined context value from a connection */
 void *
 fd_quic_conn_get_context( fd_quic_conn_t * conn );
+
+
+/* set all conns to not visited, used for validation */
+void
+fd_quic_conn_validate_init( fd_quic_t * quic );
 
 FD_PROTOTYPES_END
 

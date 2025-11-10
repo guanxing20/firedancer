@@ -9,13 +9,13 @@
 #include "generated/vm.pb.h"
 
 static int
-fd_runtime_fuzz_vm_syscall_noop( void * _vm,
-                                 ulong arg0,
-                                 ulong arg1,
-                                 ulong arg2,
-                                 ulong arg3,
-                                 ulong arg4,
-                                 ulong* _ret){
+fd_solfuzz_vm_syscall_noop( void * _vm,
+                            ulong arg0,
+                            ulong arg1,
+                            ulong arg2,
+                            ulong arg3,
+                            ulong arg4,
+                            ulong* _ret){
   /* TODO: have input message determine CUs to deduct?
   fd_vm_t * vm = (fd_vm_t *) _vm;
   vm->cu = vm->cu - 5;
@@ -32,9 +32,9 @@ fd_runtime_fuzz_vm_syscall_noop( void * _vm,
 }
 
 static fd_sbpf_syscalls_t *
-fd_runtime_fuzz_lookup_syscall_func( fd_sbpf_syscalls_t * syscalls,
-                                     const char *         syscall_name,
-                                     size_t               len) {
+fd_solfuzz_vm_syscall_lookup_func( fd_sbpf_syscalls_t * syscalls,
+                                   const char *         syscall_name,
+                                   size_t               len) {
   ulong i;
 
   if (!syscall_name) return NULL;
@@ -51,12 +51,12 @@ fd_runtime_fuzz_lookup_syscall_func( fd_sbpf_syscalls_t * syscalls,
 }
 
 static ulong
-fd_runtime_fuzz_load_from_vm_input_regions( fd_vm_input_region_t const *        input,
-                                            uint                                input_count,
-                                            fd_exec_test_input_data_region_t ** output,
-                                            pb_size_t *                         output_count,
-                                            void *                              output_buf,
-                                            ulong                               output_bufsz ) {
+fd_solfuzz_vm_load_from_input_regions( fd_vm_input_region_t const *        input,
+                                       uint                                input_count,
+                                       fd_exec_test_input_data_region_t ** output,
+                                       pb_size_t *                         output_count,
+                                       void *                              output_buf,
+                                       ulong                               output_bufsz ) {
   /* pre-flight checks on output buffer size*/
   ulong input_regions_total_sz = 0;
   for( ulong i=0; i<input_count; i++ ) {
@@ -82,11 +82,15 @@ fd_runtime_fuzz_load_from_vm_input_regions( fd_vm_input_region_t const *        
     out_region->is_writable = vm_region->is_writable;
     out_region->offset = vm_region->vaddr_offset;
 
-    out_region->content = FD_SCRATCH_ALLOC_APPEND( l, alignof(pb_bytes_array_t),
-                                               PB_BYTES_ARRAY_T_ALLOCSIZE(vm_region->region_sz) );
-    FD_TEST( out_region->content );
-    out_region->content->size = vm_region->region_sz;
-    fd_memcpy( out_region->content->bytes, (void *)vm_region->haddr, vm_region->region_sz );
+    if( vm_region->region_sz > 0 ) {
+      out_region->content = FD_SCRATCH_ALLOC_APPEND( l, alignof(pb_bytes_array_t),
+                                                 PB_BYTES_ARRAY_T_ALLOCSIZE(vm_region->region_sz) );
+      FD_TEST( out_region->content );
+      out_region->content->size = vm_region->region_sz;
+      fd_memcpy( out_region->content->bytes, (void *)vm_region->haddr, vm_region->region_sz );
+    } else {
+      out_region->content = NULL;
+    }
   }
 
   ulong end = FD_SCRATCH_ALLOC_FINI( l, 1UL );
@@ -95,24 +99,24 @@ fd_runtime_fuzz_load_from_vm_input_regions( fd_vm_input_region_t const *        
 
 
 ulong
-fd_solfuzz_vm_interp_run( fd_solfuzz_runner_t * runner,
-                          void const *          input_,
-                          void **               output_,
-                          void *                output_buf,
-                          ulong                 output_bufsz ) {
+fd_solfuzz_pb_vm_interp_run( fd_solfuzz_runner_t * runner,
+                             void const *          input_,
+                             void **               output_,
+                             void *                output_buf,
+                             ulong                 output_bufsz ) {
   fd_exec_test_syscall_context_t const * input = fd_type_pun_const( input_ );
   fd_exec_test_syscall_effects_t      ** output = fd_type_pun( output_ );
 
   /* Create execution context */
   const fd_exec_test_instr_context_t * input_instr_ctx = &input->instr_ctx;
   fd_exec_instr_ctx_t instr_ctx[1];
-  if( !fd_runtime_fuzz_instr_ctx_create( runner, instr_ctx, input_instr_ctx, true /* is_syscall avoids certain checks we don't want */ ) ) {
-    fd_runtime_fuzz_instr_ctx_destroy( runner, instr_ctx );
+  if( !fd_solfuzz_pb_instr_ctx_create( runner, instr_ctx, input_instr_ctx, true /* is_syscall avoids certain checks we don't want */ ) ) {
+    fd_solfuzz_pb_instr_ctx_destroy( runner, instr_ctx );
     return 0UL;
   }
 
   if( !( input->has_vm_ctx ) ) {
-    fd_runtime_fuzz_instr_ctx_destroy( runner, instr_ctx );
+    fd_solfuzz_pb_instr_ctx_destroy( runner, instr_ctx );
     return 0UL;
   }
 
@@ -127,7 +131,7 @@ fd_solfuzz_vm_interp_run( fd_solfuzz_runner_t * runner,
   *effects = (fd_exec_test_syscall_effects_t) FD_EXEC_TEST_SYSCALL_EFFECTS_INIT_ZERO;
 
   if( FD_UNLIKELY( _l > output_end ) ) {
-    fd_runtime_fuzz_instr_ctx_destroy( runner, instr_ctx );
+    fd_solfuzz_pb_instr_ctx_destroy( runner, instr_ctx );
     return 0UL;
   }
 
@@ -145,8 +149,9 @@ do{
   ulong                    pre_lens[256]                           = {0};
   fd_vm_input_region_t     input_mem_regions[1000]                 = {0}; /* We can have a max of (3 * num accounts + 1) regions */
   fd_vm_acc_region_meta_t  acc_region_metas[256]                   = {0}; /* instr acc idx to idx */
-  uint                     input_mem_regions_cnt                   = 0U;
-  int                      direct_mapping                          = FD_FEATURE_ACTIVE( instr_ctx->txn_ctx->slot, &instr_ctx->txn_ctx->features, bpf_account_data_direct_mapping );
+  uint                     input_mem_regions_cnt                   = 0UL;
+  int                      direct_mapping                          = FD_FEATURE_ACTIVE( instr_ctx->txn_ctx->slot, &instr_ctx->txn_ctx->features, account_data_direct_mapping );
+  int                      stricter_abi_and_runtime_constraints    = FD_FEATURE_ACTIVE( instr_ctx->txn_ctx->slot, &instr_ctx->txn_ctx->features, stricter_abi_and_runtime_constraints );
 
   uchar *                  input_ptr      = NULL;
   uchar                    program_id_idx = instr_ctx->instr->program_id;
@@ -158,7 +163,7 @@ do{
   int stack_push_err = fd_instr_stack_push( instr_ctx->txn_ctx, (fd_instr_info_t *)instr_ctx->instr );
   if( FD_UNLIKELY( stack_push_err ) ) {
     FD_LOG_WARNING(( "instr stack push err" ));
-    fd_runtime_fuzz_instr_ctx_destroy( runner, instr_ctx );
+    fd_solfuzz_pb_instr_ctx_destroy( runner, instr_ctx );
     return 0;
   }
 
@@ -169,11 +174,12 @@ do{
                                                       input_mem_regions,
                                                       &input_mem_regions_cnt,
                                                       acc_region_metas,
+                                                      stricter_abi_and_runtime_constraints,
                                                       direct_mapping,
                                                       is_deprecated,
                                                       &input_ptr );
   if( FD_UNLIKELY( err ) ) {
-    fd_runtime_fuzz_instr_ctx_destroy( runner, instr_ctx );
+    fd_solfuzz_pb_instr_ctx_destroy( runner, instr_ctx );
     return 0;
   }
 
@@ -210,7 +216,7 @@ do{
 
   for( ulong i=0; i< fd_sbpf_syscalls_slot_cnt(); i++ ){
     if( !fd_sbpf_syscalls_key_inval( syscalls[i].key ) ) {
-      syscalls[i].func = fd_runtime_fuzz_vm_syscall_noop;
+      syscalls[i].func = fd_solfuzz_vm_syscall_noop;
     }
   }
 
@@ -248,6 +254,7 @@ do{
     acc_region_metas, /* vm_acc_region_meta*/
     is_deprecated, /* is deprecated */
     direct_mapping, /* direct mapping */
+    stricter_abi_and_runtime_constraints, /* stricter_abi_and_runtime_constraints */
     0 /* dump_syscall_to_pb */
   );
 
@@ -356,28 +363,30 @@ do{
 
   /* Capture input data regions */
   ulong tmp_end = FD_SCRATCH_ALLOC_FINI(l, 1UL);
-  ulong input_data_regions_size = fd_runtime_fuzz_load_from_vm_input_regions( vm->input_mem_regions,
-                                                                              vm->input_mem_regions_cnt,
-                                                                              &effects->input_data_regions,
-                                                                              &effects->input_data_regions_count,
-                                                                              (void *) tmp_end,
-                                                                              fd_ulong_sat_sub( output_end, tmp_end) );
+  ulong input_data_regions_size = fd_solfuzz_vm_load_from_input_regions(
+      vm->input_mem_regions,
+      vm->input_mem_regions_cnt,
+      &effects->input_data_regions,
+      &effects->input_data_regions_count,
+      (void *) tmp_end,
+      fd_ulong_sat_sub( output_end, tmp_end )
+  );
   FD_SCRATCH_ALLOC_APPEND( l, 1UL, input_data_regions_size );
 
 } while(0);
 
   ulong actual_end = FD_SCRATCH_ALLOC_FINI( l, 1UL );
   *output = effects;
-  fd_runtime_fuzz_instr_ctx_destroy( runner, instr_ctx );
+  fd_solfuzz_pb_instr_ctx_destroy( runner, instr_ctx );
   return actual_end - (ulong)output_buf;
 }
 
 ulong
-fd_solfuzz_syscall_run( fd_solfuzz_runner_t * runner,
-                        void const *          input_,
-                        void **               output_,
-                        void *                output_buf,
-                        ulong                 output_bufsz ) {
+fd_solfuzz_pb_syscall_run( fd_solfuzz_runner_t * runner,
+                           void const *          input_,
+                           void **               output_,
+                           void *                output_buf,
+                           ulong                 output_bufsz ) {
   fd_exec_test_syscall_context_t const * input =  fd_type_pun_const( input_ );
   fd_exec_test_syscall_effects_t **      output = fd_type_pun( output_ );
 
@@ -388,7 +397,7 @@ fd_solfuzz_syscall_run( fd_solfuzz_runner_t * runner,
   int is_cpi            = !strncmp( (const char *)input->syscall_invocation.function_name.bytes, "sol_invoke_signed", 17 );
   int skip_extra_checks = !is_cpi;
 
-  if( !fd_runtime_fuzz_instr_ctx_create( runner, ctx, input_instr_ctx, skip_extra_checks ) )
+  if( !fd_solfuzz_pb_instr_ctx_create( runner, ctx, input_instr_ctx, skip_extra_checks ) )
     goto error;
 
   ctx->txn_ctx->instr_trace[0].instr_info = (fd_instr_info_t *)ctx->instr;
@@ -445,12 +454,13 @@ fd_solfuzz_syscall_run( fd_solfuzz_runner_t * runner,
   /* If the program ID account owner is the v1 BPF loader, then alignment is disabled (controlled by
      the `is_deprecated` flag) */
 
-  ulong                   input_sz                = 0UL;
-  ulong                   pre_lens[256]           = {0};
-  fd_vm_input_region_t    input_mem_regions[1000] = {0}; /* We can have a max of (3 * num accounts + 1) regions */
-  fd_vm_acc_region_meta_t acc_region_metas[256]   = {0}; /* instr acc idx to idx */
-  uint                    input_mem_regions_cnt   = 0U;
-  int                     direct_mapping          = FD_FEATURE_ACTIVE( ctx->txn_ctx->slot, &ctx->txn_ctx->features, bpf_account_data_direct_mapping );
+  ulong                   input_sz                               = 0UL;
+  ulong                   pre_lens[256]                          = {0};
+  fd_vm_input_region_t    input_mem_regions[1000]                = {0}; /* We can have a max of (3 * num accounts + 1) regions */
+  fd_vm_acc_region_meta_t acc_region_metas[256]                  = {0}; /* instr acc idx to idx */
+  uint                    input_mem_regions_cnt                  = 0U;
+  int                     direct_mapping                         = FD_FEATURE_ACTIVE( ctx->txn_ctx->slot, &ctx->txn_ctx->features, account_data_direct_mapping );
+  int                     stricter_abi_and_runtime_constraints   = FD_FEATURE_ACTIVE( ctx->txn_ctx->slot, &ctx->txn_ctx->features, stricter_abi_and_runtime_constraints );
 
   uchar *            input_ptr      = NULL;
   uchar              program_id_idx = ctx->instr->program_id;
@@ -472,6 +482,7 @@ fd_solfuzz_syscall_run( fd_solfuzz_runner_t * runner,
                                                       input_mem_regions,
                                                       &input_mem_regions_cnt,
                                                       acc_region_metas,
+                                                      stricter_abi_and_runtime_constraints,
                                                       direct_mapping,
                                                       is_deprecated,
                                                       &input_ptr );
@@ -500,7 +511,8 @@ fd_solfuzz_syscall_run( fd_solfuzz_runner_t * runner,
               input_mem_regions_cnt,
               acc_region_metas,
               is_deprecated,
-              FD_FEATURE_ACTIVE( ctx->txn_ctx->slot, &ctx->txn_ctx->features, bpf_account_data_direct_mapping ),
+              direct_mapping,
+              stricter_abi_and_runtime_constraints,
               0 /* dump_syscall_to_pb */ );
 
   // Override some execution state values from the syscall fuzzer input
@@ -532,7 +544,7 @@ fd_solfuzz_syscall_run( fd_solfuzz_runner_t * runner,
 
   // Look up the syscall to execute
   char * syscall_name = (char *)input->syscall_invocation.function_name.bytes;
-  fd_sbpf_syscalls_t const * syscall = fd_runtime_fuzz_lookup_syscall_func(syscalls, syscall_name, input->syscall_invocation.function_name.size);
+  fd_sbpf_syscalls_t const * syscall = fd_solfuzz_vm_syscall_lookup_func(syscalls, syscall_name, input->syscall_invocation.function_name.size);
   if( !syscall ) {
     goto error;
   }
@@ -637,12 +649,14 @@ fd_solfuzz_syscall_run( fd_solfuzz_runner_t * runner,
   /* Capture input regions */
   effects->inputdata = NULL; /* Deprecated, using input_data_regions instead */
   ulong tmp_end = FD_SCRATCH_ALLOC_FINI( l, 1UL );
-  ulong input_regions_size = fd_runtime_fuzz_load_from_vm_input_regions( vm->input_mem_regions,
-                                                                         vm->input_mem_regions_cnt,
-                                                                         &effects->input_data_regions,
-                                                                         &effects->input_data_regions_count,
-                                                                         (void *)tmp_end,
-                                                                         fd_ulong_sat_sub( output_end, tmp_end ) );
+  ulong input_regions_size = fd_solfuzz_vm_load_from_input_regions(
+      vm->input_mem_regions,
+      vm->input_mem_regions_cnt,
+      &effects->input_data_regions,
+      &effects->input_data_regions_count,
+      (void *)tmp_end,
+      fd_ulong_sat_sub( output_end, tmp_end )
+  );
 
   if( !!vm->input_mem_regions_cnt && !effects->input_data_regions ) {
     goto error;
@@ -650,12 +664,12 @@ fd_solfuzz_syscall_run( fd_solfuzz_runner_t * runner,
 
   /* Return the effects */
   ulong actual_end = tmp_end + input_regions_size;
-  fd_runtime_fuzz_instr_ctx_destroy( runner, ctx );
+  fd_solfuzz_pb_instr_ctx_destroy( runner, ctx );
 
   *output = effects;
   return actual_end - (ulong)output_buf;
 
 error:
-  fd_runtime_fuzz_instr_ctx_destroy( runner, ctx );
+  fd_solfuzz_pb_instr_ctx_destroy( runner, ctx );
   return 0;
 }

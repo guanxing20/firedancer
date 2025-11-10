@@ -1,5 +1,7 @@
 #include "fd_txn_account.h"
 #include "fd_runtime.h"
+#include "../accdb/fd_accdb_sync.h"
+#include "program/fd_program_util.h"
 
 void *
 fd_txn_account_new( void *              mem,
@@ -30,8 +32,6 @@ fd_txn_account_new( void *              mem,
 
   fd_memcpy( txn_account->pubkey, pubkey, sizeof(fd_pubkey_t) );
 
-  fd_wksp_t * wksp = fd_wksp_containing( meta );
-
   txn_account->magic             = FD_TXN_ACCOUNT_MAGIC;
 
   txn_account->starting_dlen     = meta->dlen;
@@ -39,17 +39,7 @@ fd_txn_account_new( void *              mem,
 
   uchar * data = (uchar *)meta + sizeof(fd_account_meta_t);
 
-  txn_account->meta_gaddr = fd_wksp_gaddr( wksp, meta );
-  if( FD_UNLIKELY( !txn_account->meta_gaddr ) ) {
-    FD_LOG_WARNING(( "meta_gaddr is 0" ));
-    return NULL;
-  }
-
-  txn_account->data_gaddr = fd_wksp_gaddr( wksp, data );
-  if( FD_UNLIKELY( !txn_account->data_gaddr ) ) {
-    FD_LOG_WARNING(( "data_gaddr is 0" ));
-    return NULL;
-  }
+  txn_account->meta_soff = (long)( (ulong)meta - (ulong)mem );
 
   txn_account->meta       = meta;
   txn_account->data       = data;
@@ -59,7 +49,7 @@ fd_txn_account_new( void *              mem,
 }
 
 fd_txn_account_t *
-fd_txn_account_join( void * mem, fd_wksp_t * data_wksp ) {
+fd_txn_account_join( void * mem ) {
   if( FD_UNLIKELY( !mem ) ) {
     FD_LOG_WARNING(( "NULL mem" ));
     return NULL;
@@ -70,11 +60,6 @@ fd_txn_account_join( void * mem, fd_wksp_t * data_wksp ) {
     return NULL;
   }
 
-  if( FD_UNLIKELY( !data_wksp ) ) {
-    FD_LOG_WARNING(( "NULL data_wksp" ));
-    return NULL;
-  }
-
   fd_txn_account_t * txn_account = (fd_txn_account_t *)mem;
 
   if( FD_UNLIKELY( txn_account->magic != FD_TXN_ACCOUNT_MAGIC ) ) {
@@ -82,21 +67,8 @@ fd_txn_account_join( void * mem, fd_wksp_t * data_wksp ) {
     return NULL;
   }
 
-  if( FD_UNLIKELY( txn_account->meta_gaddr==0UL ) ) {
-    FD_LOG_WARNING(( "`meta gaddr is 0" ));
-    return NULL;
-  }
-
-  txn_account->meta = fd_wksp_laddr( data_wksp, txn_account->meta_gaddr );
-  if( FD_UNLIKELY( !txn_account->meta ) ) {
-    FD_LOG_WARNING(( "meta is NULL" ));
-    return NULL;
-  }
-
-  txn_account->data = fd_wksp_laddr( data_wksp, txn_account->data_gaddr );
-  if( FD_UNLIKELY( !txn_account->data && txn_account->meta->dlen ) ) {
-    FD_LOG_WARNING(( "data is NULL" ));
-    return NULL;
+  if( FD_UNLIKELY( txn_account->meta_soff==0UL ) ) {
+    FD_LOG_CRIT(( "invalid meta_soff" ));
   }
 
   return txn_account;
@@ -148,15 +120,15 @@ fd_txn_account_delete( void * mem ) {
 /* Factory constructors from funk */
 
 int
-fd_txn_account_init_from_funk_readonly( fd_txn_account_t *    acct,
-                                        fd_pubkey_t const *   pubkey,
-                                        fd_funk_t const *     funk,
-                                        fd_funk_txn_t const * funk_txn ) {
+fd_txn_account_init_from_funk_readonly( fd_txn_account_t *        acct,
+                                        fd_pubkey_t const *       pubkey,
+                                        fd_funk_t const *         funk,
+                                        fd_funk_txn_xid_t const * xid ) {
 
   int err = FD_ACC_MGR_SUCCESS;
   fd_account_meta_t const * meta = fd_funk_get_acc_meta_readonly(
       funk,
-      funk_txn,
+      xid,
       pubkey,
       NULL,
       &err,
@@ -166,63 +138,62 @@ fd_txn_account_init_from_funk_readonly( fd_txn_account_t *    acct,
     return err;
   }
 
-  if( FD_UNLIKELY( !fd_txn_account_join( fd_txn_account_new(
+  if( FD_UNLIKELY( !fd_txn_account_new(
         acct,
         pubkey,
         (fd_account_meta_t *)meta,
-        0 ), fd_funk_wksp( funk ) ) ) ) {
+        0 ) ) ) {
     FD_LOG_CRIT(( "Failed to join txn account" ));
   }
 
   return FD_ACC_MGR_SUCCESS;
 }
 
-int
-fd_txn_account_init_from_funk_mutable( fd_txn_account_t *      acct,
-                                       fd_pubkey_t const *     pubkey,
-                                       fd_funk_t *             funk,
-                                       fd_funk_txn_t *         funk_txn,
-                                       int                     do_create,
-                                       ulong                   min_data_sz,
-                                       fd_funk_rec_prepare_t * prepare_out ) {
+fd_account_meta_t *
+fd_txn_account_init_from_funk_mutable( fd_txn_account_t *        acct,
+                                       fd_pubkey_t const *       pubkey,
+                                       fd_accdb_user_t *         accdb,
+                                       fd_funk_txn_xid_t const * xid,
+                                       int                       do_create,
+                                       ulong                     min_data_sz,
+                                       fd_funk_rec_prepare_t *   prepare_out ) {
   memset( prepare_out, 0, sizeof(fd_funk_rec_prepare_t) );
-  int err = FD_ACC_MGR_SUCCESS;
-  fd_account_meta_t * meta = fd_funk_get_acc_meta_mutable(
-      funk,
-      funk_txn,
-      pubkey,
-      do_create,
-      min_data_sz,
-      NULL,
-      prepare_out,
-      &err );
 
-  if( FD_UNLIKELY( err!=FD_ACC_MGR_SUCCESS ) ) {
-    return err;
+  fd_accdb_rw_t rw[1];
+  if( FD_UNLIKELY( !fd_accdb_modify_prepare( accdb, rw, xid, pubkey->uc, min_data_sz, do_create ) ) ) {
+    return NULL;
   }
-
-  /* exec tile should never call this function, so the global addresses
-     of meta and data should never be used. Instead, populate the
-     prepared_rec field so that any created records can be published
-     with fd_txn_account_mutable_fini. */
 
   if( FD_UNLIKELY( !fd_txn_account_join( fd_txn_account_new(
         acct,
         pubkey,
-        (fd_account_meta_t *)meta,
-        1 ), fd_funk_wksp( funk ) ) ) ) {
+        (fd_account_meta_t *)rw->meta,
+        1 ) ) ) ) {
     FD_LOG_CRIT(( "Failed to join txn account" ));
   }
 
-  return FD_ACC_MGR_SUCCESS;
+  /* HACKY: Convert accdb_rw writable reference into txn_account.
+     In the future, use fd_accdb_modify_publish instead */
+  accdb->rw_active--;
+  fd_funk_txn_t * txn = accdb->funk->txn_pool->ele + accdb->tip_txn_idx;
+  if( FD_UNLIKELY( !fd_funk_txn_xid_eq( &txn->xid, xid ) ) ) FD_LOG_CRIT(( "accdb_user corrupt: not joined to the expected transaction" ));
+  if( !rw->published ) {
+    *prepare_out = (fd_funk_rec_prepare_t) {
+      .rec          = rw->rec,
+      .rec_head_idx = &txn->rec_head_idx,
+      .rec_tail_idx = &txn->rec_tail_idx
+    };
+  } else {
+    memset( prepare_out, 0, sizeof(fd_funk_rec_prepare_t) );
+  }
+
+  return rw->meta;
 }
 
 void
 fd_txn_account_mutable_fini( fd_txn_account_t *      acct,
-                             fd_funk_t *             funk,
-                             fd_funk_txn_t *         txn,
+                             fd_accdb_user_t *       accdb,
                              fd_funk_rec_prepare_t * prepare ) {
-  (void)txn;
   fd_funk_rec_key_t key = fd_funk_acc_key( acct->pubkey );
 
   /* Check that the prepared record is still valid -
@@ -242,7 +213,7 @@ fd_txn_account_mutable_fini( fd_txn_account_t *      acct,
 
     /* Crashes the app if this key already exists in funk (conflicting
        write) */
-    fd_funk_rec_publish( funk, prepare );
+    fd_funk_rec_publish( accdb->funk, prepare );
   }
 }
 

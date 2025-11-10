@@ -120,13 +120,12 @@ test_quic_ping_frame( fd_quic_sandbox_t * sandbox,
   fd_quic_sandbox_init( sandbox, FD_QUIC_ROLE_SERVER );
   fd_quic_conn_t * conn = fd_quic_sandbox_new_conn_established( sandbox, rng );
   conn->ack_gen->is_elicited = 0;
-  FD_TEST( conn->svc_type == FD_QUIC_SVC_WAIT );
+  FD_TEST( conn->svc_meta.private.prq_idx != FD_QUIC_SVC_PRQ_IDX_INVAL );
 
   uchar buf[1] = {0x01};
   fd_quic_sandbox_send_lone_frame( sandbox, conn, buf, sizeof(buf) );
   FD_TEST( conn->state == FD_QUIC_CONN_STATE_ACTIVE );
   FD_TEST( conn->ack_gen->is_elicited == 1 );
-  FD_TEST( conn->svc_type == FD_QUIC_SVC_ACK_TX );
 }
 
 /* Test an ALPN failure when acting as a server */
@@ -569,16 +568,15 @@ test_quic_conn_free( fd_quic_sandbox_t * sandbox,
   for( ulong j=0UL; j<conn_max; j++ ) {
     FD_TEST( fd_quic_conn_at_idx( state, j )->our_conn_id == 0UL );
   }
-  fd_quic_svc_validate( quic );
+  fd_quic_state_validate( quic );
 
   /* Create a bunch of conns */
   for( ulong j=0UL; j<conn_max; j++ ) {
     FD_TEST( fd_quic_sandbox_new_conn_established( sandbox, rng ) );
   }
-  fd_quic_svc_validate( quic );
+  fd_quic_state_validate( quic );
 
-  /* Ensure each conn is in conn_id_map */
-  static fd_quic_conn_map_t sentinel[1] = {0};
+  /* Ensure conn in conn_id_map if and only if it's not INACTIVE */
   for( ulong j=0UL; j<conn_max; j++ ) {
     fd_quic_conn_t * conn = fd_quic_conn_at_idx( state, j );
     ulong const cid = conn->our_conn_id;
@@ -587,47 +585,21 @@ test_quic_conn_free( fd_quic_sandbox_t * sandbox,
     /* Free conn */
     fd_quic_conn_free( quic, conn );
     FD_TEST( conn->state == FD_QUIC_CONN_STATE_INVALID );
-    FD_TEST( conn->our_conn_id == cid ); /* CID is kept */
-    FD_TEST( fd_quic_conn_query1( state->conn_map, cid, sentinel )->conn==conn );
+    FD_TEST( fd_quic_conn_query( state->conn_map, cid )==NULL ); /* CID is evicted */
   }
-  fd_quic_svc_validate( quic );
+  fd_quic_state_validate( quic );
 
-  /* Now, allocate new conns.  CIDs should be replaced one by one. */
+  /* Now, allocate new conns one by one */
   for( ulong i=0UL; i<conn_max; i++ ) {
     /* LIFO allocation policy */
     ulong j = conn_max - 1UL - i;
 
     fd_quic_conn_t * conn = fd_quic_conn_at_idx( state, j );
-    ulong const old_cid = conn->our_conn_id;
-    FD_TEST( fd_quic_conn_query1( state->conn_map, old_cid, sentinel )->conn==conn );
-
     FD_TEST( fd_quic_sandbox_new_conn_established( sandbox, rng )==conn );
-    FD_TEST( fd_quic_conn_query1( state->conn_map, old_cid, sentinel )->conn==NULL );
     ulong const new_cid = conn->our_conn_id;
-    FD_TEST( fd_quic_conn_query1( state->conn_map, new_cid, sentinel )->conn==conn );
+    FD_TEST( fd_quic_conn_query( state->conn_map, new_cid )==conn );
   }
-  fd_quic_svc_validate( quic );
-
-  /* Finally, validate that packet handlers count freed conns as
-     "keys not available" in metrics.  (Logically, for the receiver
-     side, a dead conn is comparable to a conn where all receive keys
-     were discarded) */
-  fd_quic_conn_t * conn = fd_quic_conn_at_idx( state, 0UL );
-  ulong const old_cid = conn->our_conn_id;
-  fd_quic_conn_free( quic, conn );
-  conn->keys_avail = UINT_MAX;
-  FD_TEST( conn->state == FD_QUIC_CONN_STATE_INVALID );
-  FD_TEST( fd_quic_conn_query1( state->conn_map, old_cid, sentinel )->conn==conn );
-
-  FD_TEST( quic->metrics.pkt_no_key_cnt[ fd_quic_enc_level_initial_id   ]==0 );
-  FD_TEST( quic->metrics.pkt_no_key_cnt[ fd_quic_enc_level_handshake_id ]==0 );
-  FD_TEST( quic->metrics.pkt_no_key_cnt[ fd_quic_enc_level_appdata_id   ]==0 );
-  fd_quic_handle_v1_initial( quic, &conn, NULL, NULL, NULL, NULL, 0UL );
-  FD_TEST( quic->metrics.pkt_no_key_cnt[ fd_quic_enc_level_initial_id   ]==1 );
-  fd_quic_handle_v1_handshake( quic, conn, NULL, NULL, 0UL );
-  FD_TEST( quic->metrics.pkt_no_key_cnt[ fd_quic_enc_level_handshake_id ]==1 );
-  fd_quic_handle_v1_one_rtt( quic, conn, NULL, NULL, 0UL );
-  FD_TEST( quic->metrics.pkt_no_key_cnt[ fd_quic_enc_level_appdata_id   ]==1 );
+  fd_quic_state_validate( quic );
 }
 
 /* Ensure that packet numbers aren't skipped when pkt-meta runs out */
@@ -638,6 +610,7 @@ test_quic_pktmeta_pktnum_skip( fd_quic_sandbox_t * sandbox,
 
   fd_quic_sandbox_init( sandbox, FD_QUIC_ROLE_SERVER );
   fd_quic_t *                  quic    = sandbox->quic;
+  fd_quic_state_t *            state   = fd_quic_get_state( quic );
   fd_quic_conn_t *             conn    = fd_quic_sandbox_new_conn_established( sandbox, rng );
   fd_quic_metrics_t *          metrics = &conn->quic->metrics;
   fd_quic_pkt_meta_tracker_t * tracker = &conn->pkt_meta_tracker;
@@ -650,7 +623,8 @@ test_quic_pktmeta_pktnum_skip( fd_quic_sandbox_t * sandbox,
     conn->flags          = ( conn->flags & ~FD_QUIC_CONN_FLAGS_PING_SENT ) | FD_QUIC_CONN_FLAGS_PING;
     conn->upd_pkt_number = FD_QUIC_PKT_NUM_PENDING;
     sandbox->wallclock += (long)10e6;
-    fd_quic_svc_schedule1( conn, FD_QUIC_SVC_INSTANT );
+    conn->svc_meta.next_timeout = sandbox->wallclock;
+    fd_quic_svc_timers_schedule( state->svc_timers, conn, sandbox->wallclock );
     fd_quic_service( quic, sandbox->wallclock );
     FD_TEST( conn->pkt_number[2] == next_pkt_number + 1UL );
     next_pkt_number++;
@@ -680,7 +654,8 @@ test_quic_pktmeta_pktnum_skip( fd_quic_sandbox_t * sandbox,
     conn->flags          = ( conn->flags & ~FD_QUIC_CONN_FLAGS_PING_SENT ) | FD_QUIC_CONN_FLAGS_PING;
     conn->upd_pkt_number = FD_QUIC_PKT_NUM_PENDING;
     sandbox->wallclock += (long)10e6;
-    fd_quic_svc_schedule1( conn, FD_QUIC_SVC_INSTANT );
+    conn->svc_meta.next_timeout = sandbox->wallclock;
+    fd_quic_svc_timers_schedule( state->svc_timers, conn, sandbox->wallclock );
     fd_quic_service( quic, sandbox->wallclock );
     FD_TEST( conn->pkt_number[2] == next_pkt_number );
     FD_TEST( *metrics_alloc_fail_cnt > alloc_fail_cnt );
@@ -719,7 +694,8 @@ test_quic_pktmeta_pktnum_skip( fd_quic_sandbox_t * sandbox,
     conn->flags          = ( conn->flags & ~FD_QUIC_CONN_FLAGS_PING_SENT ) | FD_QUIC_CONN_FLAGS_PING;
     conn->upd_pkt_number = FD_QUIC_PKT_NUM_PENDING;
     sandbox->wallclock += (long)10e6;
-    fd_quic_svc_schedule1( conn, FD_QUIC_SVC_INSTANT );
+    conn->svc_meta.next_timeout = sandbox->wallclock;
+    fd_quic_svc_timers_schedule( state->svc_timers, conn, sandbox->wallclock );
     fd_quic_service( quic, sandbox->wallclock );
     FD_TEST( conn->pkt_number[2] == next_pkt_number + 1UL );
     next_pkt_number++;
@@ -775,7 +751,7 @@ test_quic_rtt_sample( void ) {
   SAMPLE( (long)8000e3, (long)250 );
   /* 250 ack_delay = 250 * 4us = 1000us */
   FD_TEST( conn.rtt->min_rtt      == 5000000.0f );
-  FD_TEST( conn.rtt->latest_rtt   == 7000000.0f );
+  FD_TEST( conn.rtt->latest_rtt   == 8000000.0f );
   FD_TEST( conn.rtt->smoothed_rtt == 8312500.0f );
   FD_TEST( conn.rtt->var_rtt      == 3515625.0f );
 

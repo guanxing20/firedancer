@@ -57,14 +57,18 @@
 #define FD_CONTACT_INFO_SOCKET_TVU_QUIC          (11)
 #define FD_CONTACT_INFO_SOCKET_TPU_VOTE_QUIC     (12)
 #define FD_CONTACT_INFO_SOCKET_ALPENGLOW         (13)
-#define FD_CONTACT_INFO_SOCKET_LAST              (13)
+#define FD_CONTACT_INFO_SOCKET_CNT               (14)
 
 /* https://github.com/anza-xyz/agave/blob/540d5bc56cd44e3cc61b179bd52e9a782a2c99e4/version/src/lib.rs#L95-L105 */
 
-#define FD_CONTACT_INFO_VERSION_CLIENT_SOLANA_LABS (0)
-#define FD_CONTACT_INFO_VERSION_CLIENT_JITO_LABS   (1)
-#define FD_CONTACT_INFO_VERSION_CLIENT_FIREDANCER  (2)
-#define FD_CONTACT_INFO_VERSION_CLIENT_AGAVE       (3)
+#define FD_CONTACT_INFO_VERSION_CLIENT_SOLANA_LABS   (0)
+#define FD_CONTACT_INFO_VERSION_CLIENT_JITO_LABS     (1)
+#define FD_CONTACT_INFO_VERSION_CLIENT_FRANKENDANCER (2)
+#define FD_CONTACT_INFO_VERSION_CLIENT_AGAVE         (3)
+#define FD_CONTACT_INFO_VERSION_CLIENT_AGAVE_PALADIN (4)
+#define FD_CONTACT_INFO_VERSION_CLIENT_FIREDANCER    (5)
+#define FD_CONTACT_INFO_VERSION_CLIENT_AGAVE_BAM     (6)
+#define FD_CONTACT_INFO_VERSION_CLIENT_SIG           (7)
 
 /* A contact info represents a peer node in the cluster that is
    publishing information about itself to the gossip network.  It it
@@ -101,7 +105,7 @@ struct fd_contact_info {
      indicates the node does not advertise that protocol.  For example,
      sockets[ FD_CONTACT_INFO_SOCKET_RPC ] is the IP address and port
      for the RPC service of the node. */
-  fd_ip4_port_t sockets[ FD_CONTACT_INFO_SOCKET_LAST+1UL ];
+  fd_ip4_port_t sockets[ FD_CONTACT_INFO_SOCKET_CNT ];
 
   struct {
     ushort client; /* Any ushort in [0, USHORT_MAX], although typically one of FD_CONTACT_INFO_VERSION_CLIENT_* indicating the self-reported client version */
@@ -124,9 +128,13 @@ typedef struct fd_contact_info fd_contact_info_t;
 
    The transaction is not validated or parsed in any way yet, and in
    particular the signatures have not been verified.   Transaction data
-   is arbitrary and could be empty or corrupt or malicious. */
+   is arbitrary and could be empty or corrupt or malicious.
+
+   The source peer socket is included for use by downstream monitoring
+   tools. */
 
 struct fd_gossip_vote {
+  fd_ip4_port_t socket;
   uchar vote_tower_index;
   ulong txn_sz;
   uchar txn[ 1232UL ];

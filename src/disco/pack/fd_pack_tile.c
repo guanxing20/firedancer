@@ -3,11 +3,14 @@
 #include "generated/fd_pack_tile_seccomp.h"
 
 #include "../../util/pod/fd_pod_format.h"
+#include "../../discof/replay/fd_replay_tile.h" // layering violation
+#include "../fd_txn_m.h"
 #include "../keyguard/fd_keyload.h"
 #include "../keyguard/fd_keyswitch.h"
 #include "../keyguard/fd_keyguard.h"
 #include "../metrics/fd_metrics.h"
 #include "../pack/fd_pack.h"
+#include "../pack/fd_pack_cost.h"
 #include "../pack/fd_pack_pacing.h"
 
 #include <linux/unistd.h>
@@ -45,9 +48,6 @@
 #define TIME_OFFSET 0x8000000000000000UL
 FD_STATIC_ASSERT( (ulong)LONG_MIN+TIME_OFFSET==0UL,       time_offset );
 FD_STATIC_ASSERT( (ulong)LONG_MAX+TIME_OFFSET==ULONG_MAX, time_offset );
-
-/* Optionally allow a larger limit for benchmarking */
-#define LARGER_MAX_COST_PER_BLOCK (18UL*FD_PACK_MAX_COST_PER_BLOCK_LOWER_BOUND)
 
 /* 1.6 M cost units, enough for 1 max size transaction */
 const ulong CUS_PER_MICROBLOCK = 1600000UL;
@@ -269,6 +269,11 @@ typedef struct {
     ulong all[ FD_METRICS_TOTAL_SZ ];
   } last_sched_metrics[1];
 
+    struct {
+    long time;
+    ulong all[ FD_METRICS_TOTAL_SZ ];
+  } start_block_sched_metrics[1];
+
   struct {
     ulong id;
     ulong txn_cnt;
@@ -384,6 +389,32 @@ log_end_block_metrics( fd_pack_ctx_t * ctx,
     ));
 #undef AVAIL
 #undef DELTA
+}
+
+static inline void
+get_done_packing( fd_pack_ctx_t * ctx, fd_done_packing_t * done_packing ) {
+    done_packing->microblocks_in_slot = ctx->slot_microblock_cnt;
+    fd_pack_get_block_limits( ctx->pack, done_packing->limits_usage, done_packing->limits );
+
+#define DELTA( mem, m ) (fd_metrics_tl[ MIDX(COUNTER, PACK, TRANSACTION_SCHEDULE_##m) ] - ctx->mem->all[ MIDX(COUNTER, PACK, TRANSACTION_SCHEDULE_##m) ])
+    done_packing->block_results[ FD_METRICS_ENUM_PACK_TXN_SCHEDULE_V_TAKEN_IDX      ] = DELTA( start_block_sched_metrics, TAKEN      );
+    done_packing->block_results[ FD_METRICS_ENUM_PACK_TXN_SCHEDULE_V_CU_LIMIT_IDX   ] = DELTA( start_block_sched_metrics, CU_LIMIT   );
+    done_packing->block_results[ FD_METRICS_ENUM_PACK_TXN_SCHEDULE_V_FAST_PATH_IDX  ] = DELTA( start_block_sched_metrics, FAST_PATH  );
+    done_packing->block_results[ FD_METRICS_ENUM_PACK_TXN_SCHEDULE_V_BYTE_LIMIT_IDX ] = DELTA( start_block_sched_metrics, BYTE_LIMIT );
+    done_packing->block_results[ FD_METRICS_ENUM_PACK_TXN_SCHEDULE_V_WRITE_COST_IDX ] = DELTA( start_block_sched_metrics, WRITE_COST );
+    done_packing->block_results[ FD_METRICS_ENUM_PACK_TXN_SCHEDULE_V_SLOW_PATH_IDX  ] = DELTA( start_block_sched_metrics, SLOW_PATH  );
+    done_packing->block_results[ FD_METRICS_ENUM_PACK_TXN_SCHEDULE_V_DEFER_SKIP_IDX ] = DELTA( start_block_sched_metrics, DEFER_SKIP );
+
+    done_packing->end_block_results[ FD_METRICS_ENUM_PACK_TXN_SCHEDULE_V_TAKEN_IDX      ] = DELTA( last_sched_metrics, TAKEN      );
+    done_packing->end_block_results[ FD_METRICS_ENUM_PACK_TXN_SCHEDULE_V_CU_LIMIT_IDX   ] = DELTA( last_sched_metrics, CU_LIMIT   );
+    done_packing->end_block_results[ FD_METRICS_ENUM_PACK_TXN_SCHEDULE_V_FAST_PATH_IDX  ] = DELTA( last_sched_metrics, FAST_PATH  );
+    done_packing->end_block_results[ FD_METRICS_ENUM_PACK_TXN_SCHEDULE_V_BYTE_LIMIT_IDX ] = DELTA( last_sched_metrics, BYTE_LIMIT );
+    done_packing->end_block_results[ FD_METRICS_ENUM_PACK_TXN_SCHEDULE_V_WRITE_COST_IDX ] = DELTA( last_sched_metrics, WRITE_COST );
+    done_packing->end_block_results[ FD_METRICS_ENUM_PACK_TXN_SCHEDULE_V_SLOW_PATH_IDX  ] = DELTA( last_sched_metrics, SLOW_PATH  );
+    done_packing->end_block_results[ FD_METRICS_ENUM_PACK_TXN_SCHEDULE_V_DEFER_SKIP_IDX ] = DELTA( last_sched_metrics, DEFER_SKIP );
+#undef DELTA
+
+  fd_pack_get_pending_smallest( ctx->pack, done_packing->pending_smallest, done_packing->pending_votes_smallest );
 }
 
 static inline void
@@ -538,7 +569,7 @@ after_credit( fd_pack_ctx_t *     ctx,
     *charge_busy = 1;
 
     fd_done_packing_t * done_packing = fd_chunk_to_laddr( ctx->poh_out_mem, ctx->poh_out_chunk );
-    done_packing->microblocks_in_slot = ctx->slot_microblock_cnt;
+    get_done_packing( ctx, done_packing );
 
     fd_stem_publish( stem, 1UL, fd_disco_bank_sig( ctx->leader_slot, ctx->pack_idx ), ctx->poh_out_chunk, sizeof(fd_done_packing_t), 0UL, 0UL, fd_frag_meta_ts_comp( fd_tickcount() ) );
     ctx->poh_out_chunk = fd_dcache_compact_next( ctx->poh_out_chunk, sizeof(fd_done_packing_t), ctx->poh_out_chunk0, ctx->poh_out_wmark );
@@ -777,7 +808,7 @@ after_credit( fd_pack_ctx_t *     ctx,
     log_end_block_metrics( ctx, now, "microblock" );
 
     fd_done_packing_t * done_packing = fd_chunk_to_laddr( ctx->poh_out_mem, ctx->poh_out_chunk );
-    done_packing->microblocks_in_slot = ctx->slot_microblock_cnt;
+    get_done_packing( ctx, done_packing );
 
     fd_stem_publish( stem, 1UL, fd_disco_bank_sig( ctx->leader_slot, ctx->pack_idx ), ctx->poh_out_chunk, sizeof(fd_done_packing_t), 0UL, 0UL, fd_frag_meta_ts_comp( fd_tickcount() ) );
     ctx->poh_out_chunk = fd_dcache_compact_next( ctx->poh_out_chunk, sizeof(fd_done_packing_t), ctx->poh_out_chunk0, ctx->poh_out_wmark );
@@ -808,7 +839,16 @@ during_frag( fd_pack_ctx_t * ctx,
   uchar const * dcache_entry = fd_chunk_to_laddr_const( ctx->in[ in_idx ].mem, chunk );
 
   switch( ctx->in_kind[ in_idx ] ) {
-  case IN_KIND_REPLAY:
+  case IN_KIND_REPLAY: {
+    if( FD_LIKELY( sig!=REPLAY_SIG_BECAME_LEADER ) ) return;
+
+    /* There was a leader transition.  Handle it. */
+    if( FD_UNLIKELY( chunk<ctx->in[ in_idx ].chunk0 || chunk>ctx->in[ in_idx ].wmark || sz!=sizeof(fd_became_leader_t) ) )
+      FD_LOG_ERR(( "chunk %lu %lu corrupt, not in range [%lu,%lu]", chunk, sz, ctx->in[ in_idx ].chunk0, ctx->in[ in_idx ].wmark ));
+
+    fd_memcpy( ctx->_became_leader, dcache_entry, sizeof(fd_became_leader_t) );
+    return;
+  }
   case IN_KIND_POH: {
       /* Not interested in stamped microblocks, only leader updates. */
     if( fd_disco_poh_sig_pkt_type( sig )!=POH_PKT_TYPE_BECAME_LEADER ) return;
@@ -956,23 +996,38 @@ after_frag( fd_pack_ctx_t *     ctx,
 
   long now = fd_tickcount();
 
+  ulong leader_slot = ULONG_MAX;
+  switch( ctx->in_kind[ in_idx ] ) {
+    case IN_KIND_REPLAY:
+      if( FD_UNLIKELY( sig!=REPLAY_SIG_BECAME_LEADER ) ) return;
+      leader_slot = ctx->_became_leader->slot;
+
+      memcpy( ctx->start_block_sched_metrics->all, (ulong const *)fd_metrics_tl, sizeof(ctx->start_block_sched_metrics->all) );
+      ctx->start_block_sched_metrics->time = now;
+      break;
+    case IN_KIND_POH:
+      if( fd_disco_poh_sig_pkt_type( sig )!=POH_PKT_TYPE_BECAME_LEADER ) return;
+      leader_slot = fd_disco_poh_sig_slot( sig );
+      break;
+    default:
+      break;
+  }
+
   switch( ctx->in_kind[ in_idx ] ) {
   case IN_KIND_REPLAY:
   case IN_KIND_POH: {
-    if( fd_disco_poh_sig_pkt_type( sig )!=POH_PKT_TYPE_BECAME_LEADER ) return;
-
     long now_ticks = fd_tickcount();
     long now_ns    = fd_log_wallclock();
 
     if( FD_UNLIKELY( ctx->leader_slot!=ULONG_MAX ) ) {
       fd_done_packing_t * done_packing = fd_chunk_to_laddr( ctx->poh_out_mem, ctx->poh_out_chunk );
-      done_packing->microblocks_in_slot = ctx->slot_microblock_cnt;
+      get_done_packing( ctx, done_packing );
 
       fd_stem_publish( stem, 1UL, fd_disco_bank_sig( ctx->leader_slot, ctx->pack_idx ), ctx->poh_out_chunk, sizeof(fd_done_packing_t), 0UL, 0UL, fd_frag_meta_ts_comp( fd_tickcount() ) );
       ctx->poh_out_chunk = fd_dcache_compact_next( ctx->poh_out_chunk, sizeof(fd_done_packing_t), ctx->poh_out_chunk0, ctx->poh_out_wmark );
       ctx->pack_idx++;
 
-      FD_LOG_WARNING(( "switching to slot %lu while packing for slot %lu. Draining bank tiles.", fd_disco_poh_sig_slot( sig ), ctx->leader_slot ));
+      FD_LOG_WARNING(( "switching to slot %lu while packing for slot %lu. Draining bank tiles.", leader_slot, ctx->leader_slot ));
       log_end_block_metrics( ctx, now_ticks, "switch" );
       ctx->drain_banks         = 1;
       ctx->leader_slot         = ULONG_MAX;
@@ -980,7 +1035,7 @@ after_frag( fd_pack_ctx_t *     ctx,
       fd_pack_end_block( ctx->pack );
       remove_ib( ctx );
     }
-    ctx->leader_slot = fd_disco_poh_sig_slot( sig );
+    ctx->leader_slot = leader_slot;
 
     ulong exp_cnt = fd_pack_expire_before( ctx->pack, fd_ulong_max( ctx->leader_slot, TRANSACTION_LIFETIME_SLOTS )-TRANSACTION_LIFETIME_SLOTS );
     FD_MCNT_INC( PACK, TRANSACTION_EXPIRED, exp_cnt );
@@ -1077,7 +1132,7 @@ after_frag( fd_pack_ctx_t *     ctx,
   }
   case IN_KIND_EXECUTED_TXN: {
     ulong deleted = fd_pack_delete_transaction( ctx->pack, fd_type_pun( ctx->executed_txn_sig ) );
-    FD_MCNT_INC( PACK, TRANSACTION_DELETED, deleted );
+    FD_MCNT_INC( PACK, TRANSACTION_ALREADY_EXECUTED, deleted );
     break;
   }
   }
@@ -1159,8 +1214,9 @@ unprivileged_init( fd_topo_t *      topo,
     else if( FD_LIKELY( !strcmp( link->name, "poh_pack"     ) ) ) ctx->in_kind[ i ] = IN_KIND_POH;
     else if( FD_LIKELY( !strcmp( link->name, "bank_pack"    ) ) ) ctx->in_kind[ i ] = IN_KIND_BANK;
     else if( FD_LIKELY( !strcmp( link->name, "sign_pack"    ) ) ) ctx->in_kind[ i ] = IN_KIND_SIGN;
-    else if( FD_LIKELY( !strcmp( link->name, "replay_pack"  ) ) ) ctx->in_kind[ i ] = IN_KIND_REPLAY;
+    else if( FD_LIKELY( !strcmp( link->name, "replay_out"   ) ) ) ctx->in_kind[ i ] = IN_KIND_REPLAY;
     else if( FD_LIKELY( !strcmp( link->name, "executed_txn" ) ) ) ctx->in_kind[ i ] = IN_KIND_EXECUTED_TXN;
+    else if( FD_LIKELY( !strcmp( link->name, "exec_sig"     ) ) ) ctx->in_kind[ i ] = IN_KIND_EXECUTED_TXN;
     else FD_LOG_ERR(( "pack tile has unexpected input link %lu %s", i, link->name ));
   }
 
@@ -1307,11 +1363,12 @@ unprivileged_init( fd_topo_t *      topo,
                                                        FD_MHIST_SECONDS_MAX( PACK, COMPLETE_MICROBLOCK_DURATION_SECONDS ) ) );
   ctx->metric_state = 0;
   ctx->metric_state_begin = fd_tickcount();
-  memset( ctx->metric_timing,      '\0', 16*sizeof(long)                 );
-  memset( ctx->current_bundle,     '\0', sizeof(ctx->current_bundle)     );
-  memset( ctx->blk_engine_cfg,     '\0', sizeof(ctx->blk_engine_cfg)     );
-  memset( ctx->last_sched_metrics, '\0', sizeof(ctx->last_sched_metrics) );
-  memset( ctx->crank->metrics,     '\0', sizeof(ctx->crank->metrics)     );
+  memset( ctx->metric_timing,             '\0', 16*sizeof(long)                        );
+  memset( ctx->current_bundle,            '\0', sizeof(ctx->current_bundle)            );
+  memset( ctx->blk_engine_cfg,            '\0', sizeof(ctx->blk_engine_cfg)            );
+  memset( ctx->last_sched_metrics,        '\0', sizeof(ctx->last_sched_metrics)        );
+  memset( ctx->start_block_sched_metrics, '\0', sizeof(ctx->start_block_sched_metrics) );
+  memset( ctx->crank->metrics,            '\0', sizeof(ctx->crank->metrics)            );
 
   FD_LOG_INFO(( "packing microblocks of at most %lu transactions to %lu bank tiles using strategy %i", EFFECTIVE_TXN_PER_MICROBLOCK, tile->pack.bank_tile_count, ctx->strategy ));
 

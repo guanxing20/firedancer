@@ -1,7 +1,7 @@
 #include "fd_runtime_init.h"
 #include "fd_acc_mgr.h"
+#include "fd_bank.h"
 #include "../types/fd_types.h"
-#include "context/fd_exec_slot_ctx.h"
 #include "fd_system_ids.h"
 
 /* fd_feature_restore loads a feature from the accounts database and
@@ -9,19 +9,22 @@
    address. */
 
 static void
-fd_feature_restore( fd_features_t *         features,
-                    fd_exec_slot_ctx_t *    slot_ctx,
-                    fd_feature_id_t const * id,
-                    fd_pubkey_t const *     addr ) {
+fd_feature_restore( fd_bank_t *               bank,
+                    fd_funk_t *               funk,
+                    fd_funk_txn_xid_t const * xid,
+                    fd_feature_id_t const *   id,
+                    fd_pubkey_t const *       addr ) {
+
+  fd_features_t * features = fd_bank_features_modify( bank );
 
   /* Skip reverted features */
   if( FD_UNLIKELY( id->reverted ) ) return;
 
-  FD_TXN_ACCOUNT_DECL( acct_rec );
+  fd_txn_account_t acct_rec[1];
   int err = fd_txn_account_init_from_funk_readonly( acct_rec,
                                                     addr,
-                                                    slot_ctx->funk,
-                                                    slot_ctx->funk_txn );
+                                                    funk,
+                                                    xid );
   if( FD_UNLIKELY( err!=FD_ACC_MGR_SUCCESS ) ) {
     return;
   }
@@ -51,7 +54,7 @@ fd_feature_restore( fd_features_t *         features,
 
   FD_BASE58_ENCODE_32_BYTES( addr->uc, addr_b58 );
   if( feature->has_activated_at ) {
-    FD_LOG_INFO(( "Feature %s activated at %lu", addr_b58, feature->activated_at ));
+    FD_LOG_DEBUG(( "Feature %s activated at %lu", addr_b58, feature->activated_at ));
     fd_features_set( features, id, feature->activated_at );
   } else {
     FD_LOG_DEBUG(( "Feature %s not activated at %lu", addr_b58, feature->activated_at ));
@@ -59,12 +62,13 @@ fd_feature_restore( fd_features_t *         features,
 }
 
 void
-fd_features_restore( fd_exec_slot_ctx_t * slot_ctx ) {
-  fd_features_t * features = fd_bank_features_modify( slot_ctx->bank );
+fd_features_restore( fd_bank_t *               bank,
+                     fd_funk_t *               funk,
+                     fd_funk_txn_xid_t const * xid ) {
 
   for( fd_feature_id_t const * id = fd_feature_iter_init();
                                    !fd_feature_iter_done( id );
                                id = fd_feature_iter_next( id ) ) {
-    fd_feature_restore( features, slot_ctx, id, &id->id );
+    fd_feature_restore( bank, funk, xid, id, &id->id );
   }
 }

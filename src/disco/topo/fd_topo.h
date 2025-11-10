@@ -39,8 +39,6 @@ typedef struct {
 
   ulong numa_idx;     /* The index of the NUMA node on the system that this workspace should be allocated from. */
 
-  int   is_locked;    /* If the workspace should use pages locked and pinned to a specific numa node. */
-
   /* Computed fields.  These are not supplied as configuration but calculated as needed. */
   struct {
     ulong page_sz;  /* The size of the pages that this workspace is backed by.  One of FD_PAGE_SIZE_*. */
@@ -342,6 +340,19 @@ struct fd_topo_tile {
     } gui;
 
     struct {
+      uint   listen_addr;
+      ushort listen_port;
+
+      ulong max_http_connections;
+      ulong send_buffer_size_mb;
+      ulong max_http_request_length;
+
+      ulong max_live_slots;
+
+      char identity_key_path[ PATH_MAX ];
+    } rpc;
+
+    struct {
       uint   prometheus_listen_addr;
       ushort prometheus_listen_port;
     } metric;
@@ -350,22 +361,21 @@ struct fd_topo_tile {
       ulong fec_max;
       ulong max_vote_accounts;
 
-      int   tx_metadata_storage;
       ulong funk_obj_id;
-
-      int   bootstrap;
-      char  genesis_path[ PATH_MAX ];
+      ulong txncache_obj_id;
+      ulong progcache_obj_id;
 
       char  shred_cap[ PATH_MAX ];
       char  cluster_version[ 32 ];
-      char  tower_checkpt[ PATH_MAX ];
 
       char  identity_key_path[ PATH_MAX ];
       uint  ip_addr;
       char  vote_account_path[ PATH_MAX ];
 
-      char  blockstore_file[ PATH_MAX ];
-      char  blockstore_checkpt[ PATH_MAX ];
+      ushort expected_shred_version;
+
+      ulong heap_size_gib;
+      ulong max_live_slots;
 
       /* not specified in TOML */
 
@@ -374,32 +384,37 @@ struct fd_topo_tile {
 
       ulong enable_bank_hash_cmp;
 
+      int   larger_max_cost_per_block;
+
       ulong capture_start_slot;
       char  solcap_capture[ PATH_MAX ];
       char  dump_proto_dir[ PATH_MAX ];
       int   dump_block_to_pb;
 
-      ulong manifest_dcache_obj_id;
+      struct {
+        int   enabled;
+        uchar tip_payment_program_addr[ 32 ];
+        uchar tip_distribution_program_addr[ 32 ];
+        char  vote_account_path[ PATH_MAX ];
+      } bundle;
 
-      ulong heap_size_gib;
     } replay;
 
     struct {
       ulong funk_obj_id;
+      ulong txncache_obj_id;
+      ulong progcache_obj_id;
+
+      ulong max_live_slots;
 
       ulong capture_start_slot;
+      char  solcap_capture[ PATH_MAX ];
       char  dump_proto_dir[ PATH_MAX ];
       int   dump_instr_to_pb;
       int   dump_txn_to_pb;
       int   dump_syscall_to_pb;
       int   dump_elf_to_pb;
     } exec;
-
-    struct {
-      ulong funk_obj_id;
-      char  solcap_capture[ PATH_MAX ];
-      ulong capture_start_slot;
-    } writer;
 
     struct {
       ushort send_to_port;
@@ -423,12 +438,14 @@ struct fd_topo_tile {
     struct {
       ushort  repair_intake_listen_port;
       ushort  repair_serve_listen_port;
-
-      /* non-config */
-
       char    identity_key_path[ PATH_MAX ];
       ulong   max_pending_shred_sets;
       ulong   slot_max;
+
+      /* non-config */
+
+      ulong   repair_sign_depth;
+      ulong   repair_sign_cnt;
     } repair;
 
     struct {
@@ -455,19 +472,6 @@ struct fd_topo_tile {
       uint    ip_addr;
       char  identity_key_path[ PATH_MAX ];
     } send;
-
-    struct {
-      ulong   funk_obj_id;
-      ulong   store_obj_id;
-      ushort  rpc_port;
-      ushort  tpu_port;
-      uint    tpu_ip_addr;
-      char    identity_key_path[ PATH_MAX ];
-      uint    block_index_max;
-      uint    txn_index_max;
-      uint    acct_index_max;
-      char    history_file[ PATH_MAX ];
-    } rpcserv;
 
     struct {
       uint fake_dst_ip;
@@ -506,27 +510,53 @@ struct fd_topo_tile {
       int slices_fd;
     } shredcap;
 
-    struct {
-      char  snapshots_path[ PATH_MAX ];
-      int   incremental_snapshot_fetch;
-      int   do_download;
-      uint  maximum_local_snapshot_age;
-      uint  minimum_download_speed_mib;
-      uint  maximum_download_retry_abort;
-      uint  max_full_snapshots_to_keep;
-      uint  max_incremental_snapshots_to_keep;
+#define FD_TOPO_SNAPSHOTS_GOSSIP_LIST_MAX (32UL)
+#define FD_TOPO_SNAPSHOTS_SERVERS_MAX     (16UL)
+
+    struct fd_topo_tile_snapct {
+      char snapshots_path[ PATH_MAX ];
 
       struct {
-        ulong         peers_cnt;
-        fd_ip4_port_t peers[ 16UL ];
-      } http;
+        uint max_local_full_effective_age;
+        uint max_local_incremental_age;
 
-      int diagnostics;
-    } snaprd;
+        struct {
+          int         allow_any;
+          ulong       allow_list_cnt;
+          fd_pubkey_t allow_list[ FD_TOPO_SNAPSHOTS_GOSSIP_LIST_MAX ];
+          ulong       block_list_cnt;
+          fd_pubkey_t block_list[ FD_TOPO_SNAPSHOTS_GOSSIP_LIST_MAX ];
+        } gossip;
+
+        ulong         servers_cnt;
+        fd_ip4_port_t servers[ FD_TOPO_SNAPSHOTS_SERVERS_MAX ];
+      } sources;
+
+      int  incremental_snapshots;
+      uint max_full_snapshots_to_keep;
+      uint max_incremental_snapshots_to_keep;
+      uint full_effective_age_cancel_threshold;
+    } snapct;
 
     struct {
+      char snapshots_path[ PATH_MAX ];
+    } snapld;
+
+    struct {
+      ulong max_live_slots;
       ulong funk_obj_id;
+      ulong txncache_obj_id;
+
+      uint  use_vinyl : 1;
+      ulong vinyl_meta_map_obj_id;
+      ulong vinyl_meta_pool_obj_id;
+      ulong snapwr_depth;
+      char  vinyl_path[ PATH_MAX ];
     } snapin;
+
+    struct {
+      char vinyl_path[ PATH_MAX ];
+    } snapwr;
 
     struct {
 
@@ -539,7 +569,11 @@ struct fd_topo_tile {
     } ipecho;
 
     struct {
+      ulong max_live_slots;
+
+      ulong txncache_obj_id;
       ulong funk_obj_id;
+      ulong progcache_obj_id;
     } bank;
 
     struct {
@@ -555,8 +589,23 @@ struct fd_topo_tile {
       ulong entrypoints_cnt;
       fd_ip4_port_t entrypoints[ FD_TOPO_GOSSIP_ENTRYPOINTS_MAX ];
 
+      int has_expected_genesis_hash;
+      uchar expected_genesis_hash[ 32UL ];
+
       char genesis_path[ PATH_MAX ];
+
+      uint target_gid;
+      uint target_uid;
     } genesi;
+
+    struct {
+      ulong vinyl_meta_map_obj_id;
+      ulong vinyl_meta_pool_obj_id;
+      ulong vinyl_line_max;
+      ulong vinyl_cnc_obj_id; /* optional */
+      ulong vinyl_data_obj_id;
+      char  vinyl_bstream_path[ PATH_MAX ];
+    } vinyl;
   };
 };
 
@@ -601,6 +650,7 @@ typedef struct {
 
   int          keep_host_networking;
   int          allow_connect;
+  int          allow_renameat;
   ulong        rlimit_file_cnt;
   ulong        rlimit_address_space;
   ulong        rlimit_data;
@@ -639,15 +689,9 @@ fd_topo_workspace_align( void ) {
   return 4096UL;
 }
 
-static inline void *
+void *
 fd_topo_obj_laddr( fd_topo_t const * topo,
-                   ulong             obj_id ) {
-  fd_topo_obj_t const * obj = &topo->objs[ obj_id ];
-  FD_TEST( obj_id<FD_TOPO_MAX_OBJS );
-  FD_TEST( obj->id == obj_id );
-  FD_TEST( obj->offset );
-  return (void *)((ulong)topo->workspaces[ obj->wksp_id ].wksp + obj->offset);
-}
+                   ulong             obj_id );
 
 /* Returns a pointer in the local address space to the base address of
    the workspace out of which the given object was allocated. */

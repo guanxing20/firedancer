@@ -22,6 +22,10 @@ union fdctl_args {
   } monitor;
 
   struct {
+    int drain_output_fd;
+  } watch;
+
+  struct {
     int                      command;
     struct configure_stage * stages[ CONFIGURE_STAGE_COUNT ];
   } configure;
@@ -34,12 +38,16 @@ union fdctl_args {
 
   struct {
     int  parent_pipefd;
-    int  monitor;
+    int  no_watch;
     int  no_configure;
     int  no_init_workspaces;
     int  no_agave;
     char debug_tile[ 32 ];
   } dev;
+
+  struct {
+    int no_watch;
+  } backtest;
 
   struct {
     char tile_name[ 7UL ];
@@ -72,6 +80,8 @@ union fdctl_args {
     char manifest_path[ 256UL ];
     char iptable_path[ 256UL ];
     int  metrics_only;
+    int  forest_only;
+    int  sorted;
   } repair;
 
   struct {
@@ -99,12 +109,31 @@ union fdctl_args {
   } quic_trace;
 
   struct {
-    char tile_cpus[ 256UL ];
-  } snapshot_load;
-
-  struct {
     ushort listen_port;
   } udpecho;
+
+  struct {
+    char topo[ 64 ];
+  } metrics;
+
+  struct {
+    uint fsck : 1;
+    uint accounts_hist : 1;
+    uint offline : 1;
+    uint no_incremental : 1;
+    uint no_watch : 1;
+    uint is_vinyl : 1;
+    uint vinyl_server : 1;
+
+    char snapshot_dir[ PATH_MAX ];
+    char vinyl_path   [ PATH_MAX ];
+    char vinyl_io     [ 3 ];
+
+    ulong db_sz;
+    ulong db_rec_max;
+    ulong cache_sz;
+    ulong cache_rec_max;
+  } snapshot_load;
 
 };
 

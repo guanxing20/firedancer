@@ -27,13 +27,18 @@ class Tile(Enum):
     SOCK = 21
     REPAIR = 22
     SEND = 23
-    SNAPRD = 24
-    SNAPDC = 25
-    SNAPIN = 26
-    IPECHO = 27
-    GOSSVF = 28
-    BANKF = 29
-    RESOLF = 30
+    SNAPCT = 24
+    SNAPLD = 25
+    SNAPDC = 26
+    SNAPIN = 27
+    IPECHO = 28
+    GOSSVF = 29
+    BANKF = 30
+    RESOLF = 31
+    BACKT = 32
+    EXEC = 33
+    SNAPWR = 34
+    BENCHS = 35
 
 class MetricType(Enum):
     COUNTER = 0
